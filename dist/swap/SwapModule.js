@@ -25,7 +25,7 @@ export class SwapModule {
             routerAddress: UNISWAP_V3_BASE.ROUTER,
             quoterAddress: UNISWAP_V3_BASE.QUOTER_V2,
             feeBps: PROTOCOL_FEE_BPS,
-            feeWallet: accountAddress,
+            feeWallet: '0xff86829393C6C26A4EC122bE0Cc3E466Ef876AdD',
             ...config,
         };
     }
@@ -106,7 +106,7 @@ export class SwapModule {
         const approvalTxHash = await this.ensureApproval(tokenIn, this.config.routerAddress, amountIn);
         const approvalRequired = approvalTxHash !== undefined;
         let feeTxHash;
-        if (quote.feeAmount > 0n && feeWallet !== this.accountAddress) {
+        if (quote.feeAmount > 0n) {
             feeTxHash = await this.transferFee(tokenIn, quote.feeAmount, feeWallet);
         }
         const account = this.walletClient.account;

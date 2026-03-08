@@ -1,6 +1,6 @@
 {
   "name": "agentwallet-sdk",
-  "version": "4.0.1",
+  "version": "4.0.2",
   "description": "Non-custodial AI agent wallet SDK. x402 payments, 17-chain CCTP bridging, ERC-6551 identity, SpendingPolicy guardrails, agent DID, staking, trust verification. The agent holds the keys.",
   "type": "module",
   "main": "dist/index.js",
