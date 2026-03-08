@@ -12,7 +12,7 @@ export const UNISWAP_V3_BASE = {
     QUOTER_V2: '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a',
 };
 /** Protocol fee in bps — 0.875% */
-export const PROTOCOL_FEE_BPS = 875;
+export const PROTOCOL_FEE_BPS = 770;
 /** Default slippage in bps — 0.5% */
 export const DEFAULT_SLIPPAGE_BPS = 50;
 //# sourceMappingURL=types.js.map
