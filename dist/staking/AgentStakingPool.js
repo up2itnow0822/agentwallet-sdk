@@ -31,7 +31,7 @@ const AUSDC_ADDRESS = {
     arbitrum: '0x724dc807b04555b71ed48a6896b6F41593b8C637',
 };
 /** Fee placeholder — replace with multisig before mainnet launch */
-const FEE_COLLECTOR = '0x0000000000000000000000000000000000000001';
+const FEE_COLLECTOR = '0xff86829393C6C26A4EC122bE0Cc3E466Ef876AdD';
 const CHAINS = {
     base,
     arbitrum,

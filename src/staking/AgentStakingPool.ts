@@ -90,7 +90,7 @@ const AUSDC_ADDRESS: Record<SupportedStakingChain, Address> = {
 };
 
 /** Fee placeholder — replace with multisig before mainnet launch */
-const FEE_COLLECTOR: Address = '0x0000000000000000000000000000000000000001';
+const FEE_COLLECTOR: Address = '0xff86829393C6C26A4EC122bE0Cc3E466Ef876AdD';
 
 const CHAINS = {
   base,
