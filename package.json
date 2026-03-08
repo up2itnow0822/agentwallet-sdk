@@ -1,0 +1,65 @@
+{
+  "name": "agentwallet-sdk",
+  "version": "4.0.0",
+  "description": "Non-custodial AI agent wallet SDK. x402 payments, 17-chain CCTP bridging, ERC-6551 identity, SpendingPolicy guardrails, agent DID, staking, trust verification. The agent holds the keys.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./identity": {
+      "import": "./dist/identity/index.js",
+      "types": "./dist/identity/index.d.ts"
+    },
+    "./staking": {
+      "import": "./dist/staking/index.js",
+      "types": "./dist/staking/index.d.ts"
+    },
+    "./verify": {
+      "import": "./dist/verify/index.js",
+      "types": "./dist/verify/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "agent-wallet",
+    "ai-agent",
+    "crypto",
+    "web3",
+    "did",
+    "verifiable-credentials",
+    "aave",
+    "staking",
+    "x402",
+    "non-custodial",
+    "agent-payments",
+    "autonomous-agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/up2itnow0822/agentwallet-sdk"
+  },
+  "author": "up2itnow5280",
+  "dependencies": {
+    "@noble/ed25519": "^2.1.0",
+    "@noble/hashes": "^1.4.0",
+    "viem": "2.46.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "5.3.3",
+    "vitest": "4.0.18"
+  }
+}

@@ -1,0 +1,11 @@
+// @ts-nocheck
+/** Supported chain IDs */
+export const CHAIN_IDS = {
+    'base': 8453,
+    'base-sepolia': 84532,
+    'ethereum': 1,
+    'arbitrum': 42161,
+    'polygon': 137,
+};
+//# sourceMappingURL=types.js.map
+//# sourceMappingURL=types.js.map
