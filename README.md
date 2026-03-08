@@ -1,5 +1,7 @@
 # agentwallet-sdk
 
+**The only non-custodial agent wallet SDK. Unlike Coinbase Agentic Wallets — your keys, your agent.**
+
 Non-custodial agent wallet SDK. Your agent holds its own keys — no custodian, no KYC, no freeze risk.
 
 [![npm](https://img.shields.io/npm/v/agentwallet-sdk?style=flat-square)](https://www.npmjs.com/package/agentwallet-sdk)
@@ -195,6 +197,22 @@ await agentExecute(wallet, { to: '0xSOME_SERVICE', value: 10_000000000000000n })
 | Identity | `agentwallet-sdk/identity` | Agent DID (W3C did:key) + Verifiable Credentials |
 | Staking | `agentwallet-sdk/staking` | Agent-only AAVE USDC yield pool |
 | Verify | `agentwallet-sdk/verify` | Trust bundle — DID + staking + reputation |
+
+## vs. MoonPay Agents
+
+MoonPay entered the agent wallet space with a managed offering. Here's why builders choose `agentwallet-sdk` instead:
+
+| | agentwallet-sdk | MoonPay Agents |
+|---|---|---|
+| **Open source** | ✅ MIT licensed | ❌ Closed enterprise product |
+| **x402-native** | ✅ Built-in (v2.0.1+) | ❌ No x402 support |
+| **Key custody** | Agent holds own keys | MoonPay managed |
+| **KYC required** | ❌ None | ✅ KYC-gated |
+| **Vendor lock-in** | ❌ On-chain, permissionless | ✅ Platform-dependent |
+| **Cross-chain** | 17 chains via CCTP V2 | Limited |
+| **DID / identity** | ✅ W3C did:key standard | ❌ No |
+
+The difference isn't just technical. MoonPay Agents is a closed enterprise product — your agent's payment capability depends on MoonPay's platform staying available, compliant, and willing to serve you. `agentwallet-sdk` is open-source, x402-native, and permissionless. Your agent pays because it has keys, not because a vendor approved the transaction.
 
 ## Resources
 
