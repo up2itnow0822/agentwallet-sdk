@@ -61,5 +61,6 @@
     "@types/node": "^20.0.0",
     "typescript": "5.3.3",
     "vitest": "4.0.18"
-  }
+  },
+  "deprecated": "This package is deprecated. Use the latest agentwallet-sdk from https://github.com/up2itnow0822/agent-wallet-sdk"
 }

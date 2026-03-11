@@ -1,3 +1,7 @@
+⚠️ DEPRECATED — This package has been superseded by the actively maintained version at [agent-wallet-sdk](https://github.com/up2itnow0822/agent-wallet-sdk). Please migrate to the latest version.
+
+---
+
 # agentwallet-sdk
 
 **The only non-custodial agent wallet SDK. Unlike Coinbase Agentic Wallets — your keys, your agent.**
