@@ -25,13 +25,14 @@ function memoryStore() {
 }
 function fixture() {
     const { store, records } = memoryStore();
+    let nonceConsumed = false;
     const source = { address: vault, chain: base, contract: {}, confirmations: 1, expectedCodeHash: `0x${"ab".repeat(32)}`, publicClient: { getChainId: vi.fn().mockResolvedValue(8453), readContract: vi.fn().mockImplementation(({ functionName }: {
                 functionName: string;
             }) => functionName === "tokenMessenger" ? TOKEN_MESSENGER_V2.base : 6), waitForTransactionReceipt: vi.fn() }, walletClient: { chain: base, account: { address: "0x2222222222222222222222222222222222222222" }, writeContract: vi.fn() } };
     const destination = { publicClient: { chain: mainnet, getChainId: vi.fn().mockResolvedValue(1), getTransaction: vi.fn(), getBytecode: vi.fn().mockResolvedValue("0xab"), getBalance: vi.fn().mockResolvedValue(1n), readContract: vi.fn().mockImplementation(({ functionName }: {
                 functionName: string;
-            }) => functionName === "localDomain" ? 0 : 0n), simulateContract: vi.fn().mockResolvedValue({ result: true, request: { address: MESSAGE_TRANSMITTER_V2.ethereum, abi: [], functionName: "receiveMessage" } }), waitForTransactionReceipt: vi.fn().mockResolvedValue({ status: "success" }) }, walletClient: { chain: mainnet, account: { address: "0x2222222222222222222222222222222222222222" }, getChainId: vi.fn().mockResolvedValue(1), writeContract: vi.fn().mockResolvedValue(mintHash) } };
-    const receipt = { status: "success", logs: [{ address: MESSAGE_TRANSMITTER_V2.base as Hex, topics: encodeEventTopics({ abi: MessageSentEventAbi, eventName: "MessageSent" }), data: encodeAbiParameters([{ type: "bytes" }], [message()]) }] };
+            }) => functionName === "localDomain" ? 0 : nonceConsumed ? 1n : 0n), simulateContract: vi.fn().mockResolvedValue({ result: true, request: { address: MESSAGE_TRANSMITTER_V2.ethereum, abi: [], functionName: "receiveMessage" } }), waitForTransactionReceipt: vi.fn().mockImplementation(async () => {nonceConsumed=true;return{status:'success',transactionHash:mintHash};}) }, walletClient: { chain: mainnet, account: { address: "0x2222222222222222222222222222222222222222" }, getChainId: vi.fn().mockResolvedValue(1), writeContract: vi.fn().mockResolvedValue(mintHash) } };
+    const receipt = { status: "success", transactionHash:burnHash, logs: [{ address: MESSAGE_TRANSMITTER_V2.base as Hex, topics: encodeEventTopics({ abi: MessageSentEventAbi, eventName: "MessageSent" }), data: encodeAbiParameters([{ type: "bytes" }], [message()]) }] };
     execute.mockImplementation(async (_wallet, _name, _args, options) => {
         await options.onSubmitted(burnHash);
         return { txHash: burnHash, receipt };
@@ -44,6 +45,77 @@ beforeEach(() => {
     vi.clearAllMocks();
 });
 describe("CCTP recoverable source burn and destination mint", () => {
+    it.each(['mint', 'resume', 'recover'] as const)('keeps %s unresolved for a successful replacement receipt', async (path) => {
+        const f = fixture(), record = await f.module.burn(100n, 'ethereum', {destinationAddress:recipient});
+        if (path !== 'mint') {
+            f.destination.publicClient.waitForTransactionReceipt.mockRejectedValueOnce(new Error('RPC timeout'));
+            await expect(f.module.resume(record.id)).rejects.toMatchObject({txHash:mintHash});
+        }
+        f.destination.publicClient.waitForTransactionReceipt.mockResolvedValue({status:'success',transactionHash:`0x${'99'.repeat(32)}`});
+        const attempt = path === 'mint' ? f.module.mint(record.id, {message:message(true),attestation:signature}) : path === 'resume' ? f.module.resume(record.id) : f.module.recoverMint(record.id);
+        await expect(attempt).rejects.toMatchObject({recoveryId:record.id,txHash:mintHash});
+        expect(f.records.get(record.id)?.status).toBe('mint-submitted');
+        expect(f.destination.walletClient.writeContract).toHaveBeenCalledTimes(1);
+    });
+    it.each(['mint', 'resume', 'recover'] as const)('keeps %s unresolved when a matching successful receipt did not consume the nonce', async (path) => {
+        const f = fixture(), record = await f.module.burn(100n, 'ethereum', {destinationAddress:recipient});
+        if (path !== 'mint') {
+            f.destination.publicClient.waitForTransactionReceipt.mockRejectedValueOnce(new Error('RPC timeout'));
+            await expect(f.module.resume(record.id)).rejects.toMatchObject({txHash:mintHash});
+        }
+        f.destination.publicClient.waitForTransactionReceipt.mockResolvedValue({status:'success',transactionHash:mintHash});
+        f.destination.publicClient.readContract.mockImplementation(({functionName}:{functionName:string})=>functionName==='localDomain'?0:0n);
+        const attempt = path === 'mint' ? f.module.mint(record.id, {message:message(true),attestation:signature}) : path === 'resume' ? f.module.resume(record.id) : f.module.recoverMint(record.id);
+        await expect(attempt).rejects.toMatchObject({recoveryId:record.id,txHash:mintHash});
+        expect(f.records.get(record.id)?.status).toBe('mint-submitted');
+        expect(f.destination.walletClient.writeContract).toHaveBeenCalledTimes(1);
+    });
+    it('does not reset the submitted mint for a reverted receipt belonging to another transaction', async () => {
+        const f = fixture(), record = await f.module.burn(100n, 'ethereum', {destinationAddress:recipient});
+        f.destination.publicClient.waitForTransactionReceipt.mockRejectedValueOnce(new Error('RPC timeout'));
+        await expect(f.module.resume(record.id)).rejects.toMatchObject({txHash:mintHash});
+        f.destination.publicClient.waitForTransactionReceipt.mockResolvedValue({status:'reverted',transactionHash:`0x${'99'.repeat(32)}`});
+        await expect(f.module.recoverMint(record.id)).rejects.toMatchObject({recoveryId:record.id,txHash:mintHash});
+        expect(f.records.get(record.id)?.status).toBe('mint-submitted');
+    });
+    it('retains the submitted source state for a replacement burn receipt even with copied source logs', async () => {
+        const f = fixture();
+        execute.mockImplementationOnce(async (_w,_n,_a,options)=>{await options.onSubmitted(burnHash);throw new Error('RPC timeout');});
+        await expect(f.module.burn(100n,'ethereum',{destinationAddress:recipient})).rejects.toMatchObject({txHash:burnHash});
+        const record=[...f.records.values()][0]!;
+        f.source.publicClient.waitForTransactionReceipt.mockResolvedValue({...f.receipt,transactionHash:mintHash});
+        await expect(f.module.recoverBurn(record.id)).rejects.toMatchObject({recoveryId:record.id,txHash:burnHash});
+        expect(f.records.get(record.id)?.status).toBe('burn-submitted');
+    });
+    it.each([
+        ['recover', 'success'], ['recover', 'reverted'],
+        ['resume', 'success'], ['resume', 'reverted'],
+    ] as const)('reconciles %s/%s without funding an already-submitted mint again', async (path, status) => {
+        const f = fixture(), record = await f.module.burn(100n, 'ethereum', {destinationAddress:recipient});
+        f.destination.publicClient.waitForTransactionReceipt.mockRejectedValueOnce(new Error('RPC timeout'));
+        await expect(f.module.resume(record.id)).rejects.toMatchObject({txHash:mintHash});
+        const fundingChecks = f.destination.publicClient.getBalance.mock.calls.length;
+        f.destination.publicClient.getBalance.mockResolvedValue(0n);
+        if (status === 'reverted') f.destination.publicClient.waitForTransactionReceipt.mockResolvedValue({status,transactionHash:mintHash});
+        const attempt = path === 'recover' ? f.module.recoverMint(record.id) : f.module.resume(record.id);
+        if (status === 'reverted' && path === 'resume') {
+            await expect(attempt).rejects.toMatchObject({recoveryId:record.id,txHash:mintHash});
+            expect(f.records.get(record.id)?.status).toBe('mint-submitted');
+        } else {
+            await expect(attempt).resolves.toMatchObject({status:status==='success'?'minted':'attested'});
+        }
+        expect(f.destination.publicClient.getBalance).toHaveBeenCalledTimes(fundingChecks);
+        expect(f.destination.walletClient.writeContract).toHaveBeenCalledTimes(1);
+    });
+    it('revalidates previously marked terminal mints instead of trusting a false persisted completion', async () => {
+        const f = fixture(), record = await f.module.burn(100n, 'ethereum', {destinationAddress:recipient});
+        f.destination.publicClient.waitForTransactionReceipt.mockRejectedValueOnce(new Error('RPC timeout'));
+        await expect(f.module.resume(record.id)).rejects.toMatchObject({txHash:mintHash});
+        f.records.set(record.id,{...f.records.get(record.id)!,status:'minted'});
+        f.destination.publicClient.waitForTransactionReceipt.mockResolvedValue({status:'success',transactionHash:mintHash});
+        await expect(f.module.resume(record.id)).rejects.toMatchObject({recoveryId:record.id,txHash:mintHash});
+        expect(f.destination.walletClient.writeContract).toHaveBeenCalledTimes(1);
+    });
     it("commits source burn before polling, queries transaction hash, and mints the modified attested message with a destination client", async () => {
         const f = fixture();
         safeFetch.mockImplementation(async (url) => {
@@ -136,10 +208,10 @@ describe("CCTP recoverable source burn and destination mint", () => {
     });
     it("allows explicit reconciliation of a reverted mint without reburning", async () => {
         const f = fixture();
-        f.destination.publicClient.waitForTransactionReceipt.mockResolvedValueOnce({ status: "reverted" });
+        f.destination.publicClient.waitForTransactionReceipt.mockResolvedValueOnce({ status: "reverted",transactionHash:mintHash });
         const r = await f.module.burn(100n, "ethereum", { destinationAddress: recipient });
         await expect(f.module.resume(r.id)).rejects.toMatchObject({txHash:mintHash,recoveryId:r.id,cause:{message:expect.stringMatching(/reverted/)}});
-        f.destination.publicClient.waitForTransactionReceipt.mockResolvedValueOnce({ status: "reverted" });
+        f.destination.publicClient.waitForTransactionReceipt.mockResolvedValueOnce({ status: "reverted",transactionHash:mintHash });
         await f.module.recoverMint(r.id);
         await f.module.resume(r.id);
         expect(execute).toHaveBeenCalledTimes(1);

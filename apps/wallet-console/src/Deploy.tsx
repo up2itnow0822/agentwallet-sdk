@@ -2,7 +2,6 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   encodeDeployData,
   keccak256,
-  toHex,
   formatUnits,
   type Address,
   type Hex,
@@ -16,12 +15,18 @@ import {
   type Manifest,
 } from "./security";
 import { client, explain, type Provider } from "./wallet";
+import { useReviewDialog } from "./useReviewDialog";
+import { useIntents } from "./useIntents";
+import { assertNoUnresolvedIntent, broadcastIntent, reconcileIntent } from "./intents";
 const protocols = {
   router: "0x94cC0AaC535CCDB3C01d6787D6413C739ae12bc4",
   pool: "0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27",
   messenger: "0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA",
 } as const;
 interface Draft {
+  owner: Address;
+  session: number;
+  provider: Provider;
   data: Hex;
   operator: Address;
   fee: string;
@@ -40,63 +45,60 @@ async function deploymentChecks(provider: Provider, owner: Address) {
 }
 export default function Deploy({
   account,
+  session,
   onManifest,
   onClose,
 }: {
   account?: Address;
+  session: number;
   onManifest: (m: Manifest) => void;
   onClose: () => void;
 }) {
+  const journal = useIntents();
   const [operator, setOperator] = useState(""),
     [draft, setDraft] = useState<Draft>(),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(""),
     [hash, setHash] = useState<Hex>(),
+    [intentId, setIntentId] = useState<string>(),
     [result, setResult] = useState<Manifest>();
   const modal = useRef<HTMLDivElement>(null);
+  const current = useRef({ account, session });
+  current.current = { account, session };
+  const intent = journal.entries.find((record) => record.id === intentId);
+  const spent = !!intentId && intent?.status !== "rejected";
+  const submitted = hash ?? intent?.hash;
+  function isCurrent(owner: Address, epoch: number, provider: Provider) {
+    return current.current.session === epoch &&
+      current.current.account?.toLowerCase() === owner.toLowerCase() &&
+      window.ethereum === provider;
+  }
   useEffect(() => {
     setDraft(undefined);
-  }, [account]);
-  useEffect(() => {
-    if (!draft) return;
-    modal.current?.focus();
-    const listener = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !busy) setDraft(undefined);
-      if (e.key === "Tab") {
-        const buttons = modal.current?.querySelectorAll<HTMLButtonElement>(
-          "button:not(:disabled)",
-        );
-        if (!buttons?.length) return;
-        const first = buttons[0],
-          last = buttons[buttons.length - 1];
-        if (e.shiftKey && document.activeElement === first) {
-          e.preventDefault();
-          last.focus();
-        } else if (!e.shiftKey && document.activeElement === last) {
-          e.preventDefault();
-          first.focus();
-        }
-      }
-    };
-    document.addEventListener("keydown", listener);
-    return () => document.removeEventListener("keydown", listener);
-  }, [draft, busy]);
+    setBusy("");
+  }, [account, session]);
+  const rememberReviewOpener = useReviewDialog(modal, !!draft, !!busy, () => setDraft(undefined));
   async function review(e: FormEvent) {
     e.preventDefault();
+    rememberReviewOpener();
     setError("");
     setBusy("Checking chain and protocol deployments…");
+    const owner = account;
+    const epoch = session;
+    const provider = window.ethereum;
     try {
-      if (hash)
+      assertNoUnresolvedIntent();
+      if (submitted || spent)
         throw Error(
           "This deployment was already submitted. Inspect its original transaction before creating another vault.",
         );
-      if (!account || !window.ethereum)
+      if (!owner || !provider)
         throw Error("Connect the owner’s external wallet first.");
       const op = address(operator, "operator");
-      if (op.toLowerCase() === account.toLowerCase())
+      if (op.toLowerCase() === owner.toLowerCase())
         throw Error("The operator must be different from the owner.");
-      await deploymentChecks(window.ethereum, account);
-      const rpc = client(window.ethereum);
+      await deploymentChecks(provider, owner);
+      const rpc = client(provider);
       const hashes: Record<string, Hex> = {};
       for (const [name, a] of Object.entries(protocols)) {
         const code = await rpc.getCode({ address: a });
@@ -110,7 +112,7 @@ export default function Deploy({
         abi: vaultAbi,
         bytecode: AgentVaultBytecode,
         args: [
-          account,
+          owner,
           op,
           protocols.router,
           protocols.pool,
@@ -118,27 +120,37 @@ export default function Deploy({
           6,
         ],
       });
-      const gas = await rpc.estimateGas({ account, data });
+      const gas = await rpc.estimateGas({ account: owner, data });
       const price = await rpc.getGasPrice();
+      if (!isCurrent(owner, epoch, provider)) return;
       setDraft({
+        owner,
+        session: epoch,
+        provider,
         data,
         operator: op,
         fee: formatUnits(gas * price, 18),
         hashes,
       });
     } catch (e) {
-      setError(explain(e));
+      if (current.current.session === epoch) setError(explain(e));
     } finally {
-      setBusy("");
+      if (current.current.session === epoch) setBusy("");
     }
   }
   async function deploy() {
-    if (!draft || !account || !window.ethereum || hash) return;
+    if (!draft || !account || !window.ethereum || submitted || spent || journal.blocked) return;
     setBusy("Confirm contract creation in your wallet…");
     setError("");
     try {
-      await deploymentChecks(window.ethereum, account);
-      const rpc = client(window.ethereum);
+      const checked = draft;
+      const assertCurrent = () => {
+        if (!isCurrent(checked.owner, checked.session, checked.provider))
+          throw Error("Wallet changed since deployment review. Reconnect and review again.");
+      };
+      assertCurrent();
+      await deploymentChecks(checked.provider, checked.owner);
+      const rpc = client(checked.provider);
       for (const [name, a] of Object.entries(protocols)) {
         const code = await rpc.getCode({ address: a });
         if (!code || keccak256(code) !== draft.hashes[name])
@@ -146,25 +158,22 @@ export default function Deploy({
             "Protocol code changed since review. Start a new deployment review.",
           );
       }
-      const gas = await rpc.estimateGas({ account, data: draft.data });
-      const txHash = await window.ethereum.request({
-        method: "eth_sendTransaction",
-        params: [
-          {
-            from: account,
-            data: draft.data,
-            gas: toHex(gas),
-            chainId: toHex(84532),
-          },
-        ],
+      const gas = await rpc.estimateGas({ account: checked.owner, data: checked.data });
+      assertCurrent();
+      // Protocol checks and gas estimation can outlast a wallet change. Check
+      // the reviewed owner and chain again immediately before external signing.
+      await deploymentChecks(checked.provider, checked.owner);
+      assertCurrent();
+      const { hash: txHash, intentId } = await broadcastIntent(checked.provider, {
+        kind: "deployment", chainId: 84532, from: checked.owner,
+        data: checked.data, gas, label: "Deploy a new testnet vault",
+        meta: { owner: checked.owner, operator: checked.operator }, assertCurrent,
+        onClaimed: (intent) => setIntentId(intent.id),
+      }, (submitted) => {
+        setHash(submitted);
+        setBusy("Deployment submitted · waiting for 2 confirmations…");
       });
-      setHash(txHash);
-      setBusy("Deployment submitted · waiting for 2 confirmations…");
-      const receipt = await rpc.waitForTransactionReceipt({
-        hash: txHash,
-        confirmations: 2,
-        timeout: 180000,
-      });
+      const { receipt } = await reconcileIntent(checked.provider, intentId, txHash);
       validateReceipt(receipt, txHash);
       if (!receipt.contractAddress)
         throw Error(
@@ -190,7 +199,7 @@ export default function Deploy({
           rpc.readContract({ ...base, functionName: "sourceDomain" }),
         ]);
       if (
-        owner.toLowerCase() !== account.toLowerCase() ||
+        owner.toLowerCase() !== checked.owner.toLowerCase() ||
         version !== 1n ||
         !active ||
         router.toLowerCase() !== protocols.router.toLowerCase() ||
@@ -226,13 +235,14 @@ export default function Deploy({
         ],
         deploymentEvidence: txHash,
       });
+      if (!isCurrent(checked.owner, checked.session, checked.provider)) return;
       setResult(manifest);
       setDraft(undefined);
       onManifest(manifest);
     } catch (e) {
-      setError(explain(e));
+      if (current.current.session === draft.session) setError(explain(e));
     } finally {
-      setBusy("");
+      if (current.current.session === draft.session) setBusy("");
     }
   }
   function download() {
@@ -287,7 +297,7 @@ export default function Deploy({
               Use the operator’s public address. Never paste a secret.
             </small>
           </label>
-          <button className="primary" disabled={!account || !!busy || !!hash}>
+          <button className="primary" disabled={!account || !!busy || !!submitted || spent || journal.blocked}>
             Review deployment →
           </button>
         </form>
@@ -344,14 +354,14 @@ export default function Deploy({
           {error}
         </p>
       )}
-      {hash && (
+      {submitted && (
         <a
           className="text-button"
           target="_blank"
           rel="noopener noreferrer"
-          href={`https://sepolia.basescan.org/tx/${hash}`}
+          href={`https://sepolia.basescan.org/tx/${submitted}`}
         >
-          Deployment transaction {hash} ↗
+          Deployment transaction {submitted} ↗
         </a>
       )}
       {result && (
@@ -390,7 +400,7 @@ export default function Deploy({
               </div>
               <div>
                 <dt>Owner</dt>
-                <dd>{account}</dd>
+                <dd>{draft.owner}</dd>
               </div>
               <div>
                 <dt>Operator</dt>
@@ -427,9 +437,9 @@ export default function Deploy({
               <summary>Complete contract creation data</summary>
               <pre>{draft.data}</pre>
             </details>
-            {hash && (
+            {submitted && (
               <p className="form-note">
-                Deployment submitted: {hash}. Do not sign it again. Inspect the
+                Deployment submitted: {submitted}. Do not sign it again. Inspect the
                 original transaction in the explorer if its receipt is
                 unresolved.
               </p>
@@ -450,7 +460,7 @@ export default function Deploy({
               </button>
               <button
                 className="primary"
-                disabled={!!busy || !!hash}
+                disabled={!!busy || !!submitted || spent || journal.blocked}
                 onClick={deploy}
               >
                 Confirm deployment in wallet ↗

@@ -27,7 +27,10 @@ import {
   GUARDED_TRANSACTION_SCHEME,
 } from "../x402/types.js";
 import type { AgentWallet } from "../types.js";
-vi.mock("../wallet/execution.js", () => ({ executeVaultOperation: vi.fn() }));
+vi.mock("../wallet/execution.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../wallet/execution.js")>()),
+  executeVaultOperation: vi.fn(),
+}));
 // Disposable local-only signing identity. The RPC below is controlled synthetic evidence, not a live chain.
 const account = privateKeyToAccount(`0x${"01".repeat(32)}`);
 const vault = "0x1111111111111111111111111111111111111111" as const;
@@ -195,6 +198,9 @@ async function proof(merchant: GuardedPaymentMerchant) {
       asset,
       payTo: recipient,
       amount: 7n,
+      confirmations: BigInt(accepted.confirmations),
+      expiresAt: BigInt(accepted.expiresAt),
+      proofExpiresAt: BigInt(accepted.proofExpiresAt),
     },
   });
   const payload = {

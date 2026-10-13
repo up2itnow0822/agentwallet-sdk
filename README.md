@@ -18,6 +18,8 @@ Open the Vite URL. The console defaults to Base Sepolia. Its demonstration mode 
 
 The console provides balances, native/token transfers, bounded swaps, Aave supply/redemption, bridge submission and recovery, owner permissions, queued approval review, and transaction history. Transactions are simulated and shown for review before wallet confirmation; a successful receipt is required before reporting execution. A queued request is not a payment.
 
+Before asking the wallet to sign, the console saves a public recovery identity and claims an origin-wide browser lock. A lost broadcast response stays unresolved across navigation and reload, blocking further writes. Use the recovery panel with the original hash from your wallet history; it verifies the exact transaction and two-confirmation receipt. Download recovery metadata and keep the original browser profile while requests are unresolved. The journal contains public identities and calldata digests, never keys, signatures or attestations.
+
 ## Asset and authority boundaries
 
 | Component | What it does | Limits |
@@ -70,6 +72,8 @@ const hash = await agentTransferToken(wallet, {
 
 This succeeds only after the owner grants the recipient and token budget on-chain. A revert, queued transfer, wrong chain or substituted vault code rejects. If an error contains a submitted transaction hash, reconcile that transaction before retrying.
 
+Guarded HTTP payments distinguish settlement from resource delivery. A paid error response retains verified local receipt facts; an in-session proof-only retry reuses the original transaction and challenge without another transfer. Merchant confirmation depth and separate mining/proof deadlines are checked before spending. See the migration guide for the exact configuration, recovery APIs and restart limits.
+
 For payment, staking, identity and bridge migration examples, see [v5 migration](docs/migration.md). Node-only payment, registry retrieval and bridge recovery APIs must not be bundled into a browser; the console imports browser-safe ABI and message validation modules.
 
 ## Verify this branch
@@ -81,3 +85,5 @@ npm run verify
 The command performs strict TypeScript checks, unique source regression tests, adversarial contract tests on an actual local EVM, a clean contract/SDK build, installation and import checks of the actual npm tarball, a source secret scan, console build/unit/browser tests and full/production dependency audits for both packages. CI runs the same command with frozen lockfiles and fails on any error. Disposable test accounts never hold real funds. Tests using synthetic RPC evidence are distinguished from actual local-EVM tests in the [security evidence](docs/security/remediation.md).
 
 [Security policy](SECURITY.md) · [Threat model](docs/security/threat-model.md) · [Contribution guide](CONTRIBUTING.md) · [Release gates](docs/security/release-readiness.md)
+
+The [bounded CI evaluation record](docs/security/ci-evaluation.md) tracks PR #9's repair passes and review evidence. The packed SDK includes these release guides; package verification checks their presence.

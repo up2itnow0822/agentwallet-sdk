@@ -56,6 +56,8 @@ export interface ReservationBinding {
   readonly requestId: string;
   readonly expiresAt: number;
   readonly payTo?: Address;
+  readonly confirmations?: number;
+  readonly proofExpiresAt?: number;
 }
 export interface BudgetReservation {
   readonly id: string;
@@ -205,6 +207,8 @@ function validateLedger(value: unknown): asserts value is Ledger {
             "requestId",
             "expiresAt",
             "payTo",
+            "confirmations",
+            "proofExpiresAt",
           ]) ||
           typeof r.binding.resource !== "string" ||
           r.binding.resource.length > 2048 ||
@@ -212,6 +216,14 @@ function validateLedger(value: unknown): asserts value is Ledger {
           typeof r.binding.requestId !== "string" ||
           !/^[A-Za-z0-9_-]{16,128}$/.test(r.binding.requestId) ||
           !Number.isSafeInteger(r.binding.expiresAt) ||
+          (r.binding.confirmations !== undefined &&
+            (!Number.isSafeInteger(r.binding.confirmations) ||
+              Number(r.binding.confirmations) < 1 ||
+              Number(r.binding.confirmations) > 64)) ||
+          (r.binding.proofExpiresAt !== undefined &&
+            (!Number.isSafeInteger(r.binding.proofExpiresAt) ||
+              Number(r.binding.proofExpiresAt) < Number(r.binding.expiresAt) + 30000 * Number(r.binding.confirmations ?? 1) ||
+              Number(r.binding.proofExpiresAt) > Number(r.binding.expiresAt) + 86400000)) ||
           (r.binding.payTo !== undefined &&
             !isAddress(String(r.binding.payTo))))
       )
@@ -515,6 +527,10 @@ export class X402BudgetTracker {
           !Number.isSafeInteger(binding.expiresAt) ||
           binding.expiresAt <= Date.now() ||
           binding.expiresAt > Date.now() + 300000 ||
+          (binding.confirmations !== undefined &&
+            (!Number.isSafeInteger(binding.confirmations) || binding.confirmations < 1 || binding.confirmations > 64)) ||
+          (binding.proofExpiresAt !== undefined &&
+            (!Number.isSafeInteger(binding.proofExpiresAt) || binding.proofExpiresAt < binding.expiresAt + 30000 * (binding.confirmations ?? 1) || binding.proofExpiresAt > binding.expiresAt + 86400000)) ||
           !/^[A-Za-z0-9_-]{16,128}$/.test(binding.requestId) ||
           new URL(binding.resource).origin !== service
         )
@@ -528,7 +544,7 @@ export class X402BudgetTracker {
           throw new Error("Payment challenge already reserved");
         if (Object.keys(scope.requests).length >= 1000)
           throw new Error("Request history capacity reached");
-        scope.requests[key] = binding.expiresAt;
+        scope.requests[key] = binding.proofExpiresAt ?? binding.expiresAt;
       }
       if (Object.keys(scope.reservations).length >= 1000)
         throw new Error("Reservation capacity reached");
@@ -544,6 +560,8 @@ export class X402BudgetTracker {
                 resource: binding.resource,
                 requestId: binding.requestId,
                 expiresAt: binding.expiresAt,
+                ...(binding.confirmations !== undefined ? { confirmations: binding.confirmations } : {}),
+                ...(binding.proofExpiresAt !== undefined ? { proofExpiresAt: binding.proofExpiresAt } : {}),
                 ...(binding.payTo ? { payTo: binding.payTo } : {}),
               }),
             }

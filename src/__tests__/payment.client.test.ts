@@ -9,12 +9,20 @@ import {
   type X402ClientConfig,
 } from "../x402/types.js";
 import type { AgentWallet } from "../types.js";
-import { executeVaultOperation } from "../wallet/execution.js";
+import {
+  executeVaultOperation,
+  QueuedTransactionError,
+  SubmittedTransactionError,
+} from "../wallet/execution.js";
 import { encodeEventTopics, encodeAbiParameters, parseAbi } from "viem";
-vi.mock("../wallet/execution.js", () => ({ executeVaultOperation: vi.fn() }));
+vi.mock("../wallet/execution.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../wallet/execution.js")>()),
+  executeVaultOperation: vi.fn(),
+}));
 const wallet = {
   address: "0x1111111111111111111111111111111111111111",
   chain: { id: 84532 },
+  confirmations: 1,
   walletClient: {
     account: { address: "0x5555555555555555555555555555555555555555" },
     signTypedData: async () => `0x${"6".repeat(130)}`,
@@ -51,7 +59,9 @@ function challenge(overrides: Record<string, unknown> = {}): Response {
     payTo: recipient,
     resource,
     requestId: "merchant-request-id-123",
+    confirmations: 1,
     expiresAt: Date.now() + 60000,
+    proofExpiresAt: Date.now() + 3660000,
     ...overrides,
   };
   return new Response(null, {
@@ -238,6 +248,18 @@ describe("payment guarded client", () => {
     );
     const client = new X402Client(wallet, { ...config(), fetchFn });
     await expect(client.fetch(resource)).rejects.toThrow("unknown");
+    expect(client.getDailySpendSummary().global).toBe(7n);
+    expect(client.getTransactionLog()).toHaveLength(0);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    new SubmittedTransactionError("Receipt outcome unknown", hash),
+    new QueuedTransactionError(hash, 9n),
+  ])("preserves the original submitted error object: $name", async (error) => {
+    const fetchFn = vi.fn(async () => challenge());
+    vi.mocked(executeVaultOperation).mockRejectedValueOnce(error);
+    const client = new X402Client(wallet, { ...config(), fetchFn });
+    await expect(client.fetch(resource)).rejects.toBe(error);
     expect(client.getDailySpendSummary().global).toBe(7n);
     expect(client.getTransactionLog()).toHaveLength(0);
     expect(fetchFn).toHaveBeenCalledTimes(1);

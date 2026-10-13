@@ -15,6 +15,7 @@ function message(sourceDomain: number, destinationDomain: number, token: Address
     return encodePacked(["uint32", "uint32", "uint32", "bytes32", "bytes32", "bytes32", "bytes32", "uint32", "uint32", "uint32", "bytes32", "bytes32", "uint256", "bytes32", "uint256", "uint256", "uint256"], [1, sourceDomain, destinationDomain, attested ? nonce : pad("0x00", { size: 32 }), pad(messenger, { size: 32 }), pad(messenger, { size: 32 }), pad(zeroAddress, { size: 32 }), 2000, attested ? 2000 : 0, 1, pad(token, { size: 32 }), pad(recipient, { size: 32 }), 100n, pad(vault, { size: 32 }), 0n, 0n, 0n]).toLowerCase() as Hex;
 }
 function fixture(sourceChain: Chain = baseSepolia, sourceDomain = 6, token: Address = networks[0][3], destinationChain: Chain = sepolia, destinationDomain = 0) {
+    let nonceConsumed = false;
     const records = new Map<string, BridgeRecord>();
     const store: BridgeStore = { save: vi.fn(async (record) => {
             records.set(record.id, { ...record });
@@ -24,8 +25,8 @@ function fixture(sourceChain: Chain = baseSepolia, sourceDomain = 6, token: Addr
             }) => functionName === "tokenMessenger" ? messenger : sourceDomain) }, walletClient: { chain: sourceChain, account: { address: "0x2222222222222222222222222222222222222222" }, writeContract: vi.fn() } };
     const destination = { publicClient: { chain: destinationChain, getChainId: vi.fn().mockResolvedValue(destinationChain.id), getBytecode: vi.fn().mockResolvedValue("0xab"), getBalance: vi.fn().mockResolvedValue(1n), readContract: vi.fn().mockImplementation(({ functionName }: {
                 functionName: string;
-            }) => functionName === "localDomain" ? destinationDomain : 0n), simulateContract: vi.fn().mockResolvedValue({ result: true, request: { address: transmitter, abi: [], functionName: "receiveMessage" } }), waitForTransactionReceipt: vi.fn().mockResolvedValue({ status: "success" }) }, walletClient: { chain: destinationChain, account: { address: "0x2222222222222222222222222222222222222222" }, getChainId: vi.fn().mockResolvedValue(destinationChain.id), writeContract: vi.fn().mockResolvedValue(mintHash) } };
-    const receipt = { status: "success", logs: [{ address: transmitter, topics: encodeEventTopics({ abi: MessageSentEventAbi, eventName: "MessageSent" }), data: encodeAbiParameters([{ type: "bytes" }], [message(sourceDomain, destinationDomain, token)]) }] };
+            }) => functionName === "localDomain" ? destinationDomain : nonceConsumed ? 1n : 0n), simulateContract: vi.fn().mockResolvedValue({ result: true, request: { address: transmitter, abi: [], functionName: "receiveMessage" } }), waitForTransactionReceipt: vi.fn().mockImplementation(async()=>{nonceConsumed=true;return{status:'success',transactionHash:mintHash};}) }, walletClient: { chain: destinationChain, account: { address: "0x2222222222222222222222222222222222222222" }, getChainId: vi.fn().mockResolvedValue(destinationChain.id), writeContract: vi.fn().mockResolvedValue(mintHash) } };
+    const receipt = { status: "success", transactionHash:burnHash, logs: [{ address: transmitter, topics: encodeEventTopics({ abi: MessageSentEventAbi, eventName: "MessageSent" }), data: encodeAbiParameters([{ type: "bytes" }], [message(sourceDomain, destinationDomain, token)]) }] };
     execute.mockImplementation(async (_wallet, _name, _args, options) => {
         await options.onSubmitted(burnHash);
         return { txHash: burnHash, receipt };

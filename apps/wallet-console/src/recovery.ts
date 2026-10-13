@@ -31,7 +31,8 @@ import {
   client,
   verify,
   operation,
-  type Operation,
+  bindOperation,
+  type PreparedOperation,
   type Provider,
 } from "./wallet";
 export const testnetChainKeys: Record<number, BridgeChain> = {
@@ -48,7 +49,7 @@ export interface RecoveryDraft {
   record: BridgeRecord;
   destination: RecoveryManifest;
   account: Address;
-  op: Operation;
+  op: PreparedOperation;
   fee: string;
   balanceBefore: bigint;
 }
@@ -358,7 +359,7 @@ export async function prepareMint(
     record,
     destination,
     account,
-    op,
+    op: bindOperation(op, destination.manifest, account, provider),
     fee: formatUnits(gas * price, 18),
     balanceBefore,
   };

@@ -6,10 +6,13 @@ import {
   Suspense,
   type FormEvent,
 } from "react";
+import { useReviewDialog } from "./useReviewDialog";
+import { useIntents } from "./useIntents";
+import IntentRecovery from "./IntentRecovery";
+import { assertNoUnresolvedIntent, readIntents, reconcileIntent, type PublicIntent } from "./intents";
 import {
   formatUnits,
   decodeFunctionResult,
-  decodeEventLog,
   type Address,
   type Hex,
 } from "viem";
@@ -20,7 +23,6 @@ import {
   parseManifest,
   chains,
   allowWrite,
-  validateReceipt,
   type Manifest,
   type Role,
 } from "./security";
@@ -32,7 +34,10 @@ import {
   operation,
   submit,
   verify,
+  bindOperation,
   type Operation,
+  type PreparedOperation,
+  type Provider,
   type Snapshot,
   type Pending,
 } from "./wallet";
@@ -42,6 +47,7 @@ import {
   readBridgeSources,
   saveBridgeSource,
   updateBridgeSource,
+  saveMintSource,
 } from "./bridgeRecords";
 const Recovery = lazy(() => import("./Recovery"));
 const Deploy = lazy(() => import("./Deploy"));
@@ -116,6 +122,28 @@ function display(n: bigint, d: number) {
     Number(formatUnits(n, d)),
   );
 }
+function tradeFingerprint(form: HTMLFormElement) {
+  const fields = new FormData(form);
+  return JSON.stringify(
+    ["input", "output", "amount", "minimum", "fee", "minutes"].map(
+      (name) => String(fields.get(name) ?? ""),
+    ),
+  );
+}
+function formFingerprint(form: HTMLFormElement) {
+  return JSON.stringify(Array.from(new FormData(form), ([name, value]) => [name, String(value)]));
+}
+interface ReviewContext {
+  epoch: number;
+  manifest?: Manifest;
+  signer?: Address;
+  provider?: Provider;
+  demo: boolean;
+  verified: boolean;
+  role: Role;
+  form?: HTMLFormElement;
+  values?: string;
+}
 interface Activity {
   title: string;
   status: string;
@@ -125,6 +153,11 @@ interface Activity {
   deployment?: Manifest;
   data?: Hex;
   signer?: Address;
+}
+interface InspectedPending {
+  chainId: number;
+  vault: Address;
+  pending: Pending;
 }
 function Icon({ index = 0 }: { index?: number }) {
   return (
@@ -177,6 +210,7 @@ function Field({
   );
 }
 export default function App() {
+  const journal = useIntents();
   const [bridgeSources, setBridgeSources] = useState(readBridgeSources);
   const [quote, setQuote] = useState("");
   const tradeForm = useRef<HTMLFormElement>(null);
@@ -184,15 +218,17 @@ export default function App() {
   const [section, setSection] = useState<Section>("Overview");
   const [demo, setDemo] = useState(false);
   const [demoRole, setDemoRole] = useState<Role>("owner");
+  const [walletProvider, setWalletProvider] = useState(() => window.ethereum);
   const [account, setAccount] = useState<Address>();
   const [manifest, setManifest] = useState<Manifest>();
   const [manifestText, setManifestText] = useState("");
   const [snapshot, setSnapshot] = useState<Snapshot>();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
-  const [review, setReview] = useState<Operation>();
+  const [review, setReview] = useState<PreparedOperation>();
   const [gas, setGas] = useState("");
   const [reviewSubmitted, setReviewSubmitted] = useState<Hex>();
+  const [reviewIntentId, setReviewIntentId] = useState<string>();
   const [activity, setActivity] = useState<Activity[]>([]);
   const [theme, setTheme] = useState("dark");
   const [admin, setAdmin] = useState("budget");
@@ -200,10 +236,9 @@ export default function App() {
   const [bridgeHash, setBridgeHash] = useState("");
   const [bridgeStatus, setBridgeStatus] = useState("");
   const [pendingId, setPendingId] = useState("");
-  const [extraPending, setExtraPending] = useState<Pending>();
+  const [extraPending, setExtraPending] = useState<InspectedPending>();
   const modalRef = useRef<HTMLDivElement>(null);
   const generation = useRef(0);
-  const lastFocused = useRef<HTMLElement | null>(null);
   const m = demo ? demoManifest : manifest;
   const role = demo ? demoRole : (snapshot?.role ?? "observer");
   const verified = !!snapshot && !demo;
@@ -214,12 +249,31 @@ export default function App() {
     chains[(m?.chainId ?? 84532) as keyof typeof chains]?.name ??
     "Base Sepolia";
   const disabled = !demo && !verified;
-  const ownerDisabled = disabled || role !== "owner";
+  const writeBlocked = disabled || (!demo && journal.blocked);
+  const ownerDisabled = writeBlocked || role !== "owner";
+  const reviewIntent = journal.entries.find((intent) => intent.id === reviewIntentId);
+  const reviewSpent = !!reviewIntentId && reviewIntent?.status !== "rejected";
+  const reviewedHash = reviewSubmitted ?? reviewIntent?.hash;
+  const view = useRef({ manifest: m, signer: account, demo });
+  view.current = { manifest: m, signer: account, demo };
+  function reviewContext(): ReviewContext {
+    return { epoch: generation.current, manifest: m, signer: account,
+      provider: window.ethereum, demo, verified, role };
+  }
+  function currentReview(context: ReviewContext) {
+    const active = view.current;
+    return context.epoch === generation.current && context.provider === window.ethereum &&
+      context.demo === active.demo && context.signer?.toLowerCase() === active.signer?.toLowerCase() &&
+      context.manifest?.chainId === active.manifest?.chainId &&
+      context.manifest?.vault.toLowerCase() === active.manifest?.vault.toLowerCase() &&
+      context.manifest?.runtimeCodeHash.toLowerCase() === active.manifest?.runtimeCodeHash.toLowerCase() &&
+      (!context.form || (context.form.isConnected && context.values === formFingerprint(context.form)));
+  }
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
   useEffect(() => {
-    const provider = window.ethereum;
+    const provider = walletProvider;
     if (!provider) return;
     const changed = () => {
       generation.current++;
@@ -227,6 +281,11 @@ export default function App() {
       setAccount(undefined);
       setReview(undefined);
       setQuote("");
+      setExtraPending(undefined);
+      setReviewSubmitted(undefined);
+      setReviewIntentId(undefined);
+      setGas("");
+      setBusy("");
       setError(
         "Wallet account or network changed. Reconnect and verify the deployment again.",
       );
@@ -239,35 +298,8 @@ export default function App() {
       provider.removeListener("chainChanged", changed);
       provider.removeListener("disconnect", changed);
     };
-  }, []);
-  useEffect(() => {
-    if (!review) return;
-    lastFocused.current = document.activeElement as HTMLElement;
-    modalRef.current?.focus();
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) setReview(undefined);
-      if (event.key === "Tab") {
-        const els = modalRef.current?.querySelectorAll<HTMLElement>(
-          "button:not(:disabled),a[href],input",
-        );
-        if (!els?.length) return;
-        const first = els[0],
-          last = els[els.length - 1];
-        if (event.shiftKey && document.activeElement === first) {
-          event.preventDefault();
-          last.focus();
-        } else if (!event.shiftKey && document.activeElement === last) {
-          event.preventDefault();
-          first.focus();
-        }
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      lastFocused.current?.focus();
-    };
-  }, [review, busy]);
+  }, [walletProvider]);
+  const rememberReviewOpener = useReviewDialog(modalRef, !!review, !!busy, () => setReview(undefined));
   async function refresh(current = m, currentAccount = account) {
     if (!current || !currentAccount || !window.ethereum || demo) return;
     const epoch = generation.current;
@@ -276,34 +308,39 @@ export default function App() {
       const next = await load(window.ethereum, current, currentAccount);
       if (epoch !== generation.current) return;
       setSnapshot(next);
+      setExtraPending(undefined);
       setError("");
     } catch (e) {
+      if (epoch !== generation.current) return;
       setSnapshot(undefined);
       setError(explain(e));
     } finally {
-      setBusy("");
+      if (epoch === generation.current) setBusy("");
     }
   }
   async function connect() {
+    const epoch = ++generation.current;
     setError("");
     setBusy("Connecting…");
     try {
-      if (!window.ethereum)
+      const provider = window.ethereum;
+      if (!provider)
         throw Error(
           "No injected wallet found. Open this console in a browser with an Ethereum wallet extension, then connect.",
         );
       setDemo(false);
-      generation.current++;
-      const addresses = await window.ethereum.request({
+      setWalletProvider(provider);
+      const addresses = await provider.request({
         method: "eth_requestAccounts",
       });
+      if (epoch !== generation.current) return;
       if (!addresses.length) throw Error("Wallet returned no account.");
       setAccount(addresses[0]);
       if (manifest) await refresh(manifest, addresses[0]);
     } catch (e) {
-      setError(explain(e));
+      if (epoch === generation.current) setError(explain(e));
     } finally {
-      setBusy("");
+      if (epoch === generation.current) setBusy("");
     }
   }
   async function verifyManifest(e: FormEvent) {
@@ -313,6 +350,7 @@ export default function App() {
       const parsed = parseManifest(JSON.parse(manifestText));
       setManifest(parsed);
       setSnapshot(undefined);
+      setExtraPending(undefined);
       setReview(undefined);
       generation.current++;
       if (!account)
@@ -332,38 +370,32 @@ export default function App() {
     setSection("Overview");
     setError("");
   }
-  async function prepare(op: Operation) {
-    const epoch = generation.current;
+  async function prepare(op: Operation, opener?: HTMLElement, context = reviewContext()) {
+    if (!currentReview(context)) return;
+    rememberReviewOpener(opener);
+    const epoch = context.epoch;
     setError("");
     setGas("");
     try {
-      if (!demo) {
-        if (!m || !account || !window.ethereum)
+      if (!context.manifest) throw Error("Load your deployment manifest first.");
+      if (!context.demo) {
+        assertNoUnresolvedIntent();
+        if (!context.signer || !context.provider)
           throw Error("Connect a wallet and verify your deployment first.");
-        allowWrite(role, op.method, verified, false);
-        if (
-          activity.some(
-            (a) =>
-              a.status === "Submitted" || a.status === "Receipt unresolved",
-          )
-        )
-          throw Error(
-            "A submitted transaction has an unresolved receipt. Inspect it in Activity before preparing another write.",
-          );
+        allowWrite(context.role, op.method, context.verified, false);
         setBusy("Simulating transaction…");
-        const quote = await estimate(window.ethereum, m, account, op);
+        const quote = await estimate(context.provider, context.manifest, context.signer, op);
+        if (!currentReview(context)) return;
         setGas(`${quote.fee} ETH (estimate, wallet shows final fee)`);
       }
-      if (epoch !== generation.current)
-        throw Error(
-          "Wallet changed during simulation. Reconnect and review again.",
-        );
+      if (!currentReview(context)) return;
       setReviewSubmitted(undefined);
-      setReview(op);
+      setReviewIntentId(undefined);
+      setReview(bindOperation(op, context.manifest, context.signer ?? zero, context.provider));
     } catch (e) {
-      setError(explain(e));
+      if (currentReview(context)) setError(explain(e));
     } finally {
-      setBusy("");
+      if (epoch === generation.current) setBusy("");
     }
   }
   async function confirm() {
@@ -373,23 +405,24 @@ export default function App() {
       !account ||
       !window.ethereum ||
       demo ||
-      reviewSubmitted
+      reviewedHash || reviewSpent || journal.blocked
     )
       return;
     const op = review;
     const epoch = generation.current;
+    const provider = window.ethereum;
     setBusy("Confirm in your wallet…");
     setError("");
     let sent: Hex | undefined;
     try {
       const result = await submit(
-        window.ethereum,
+        provider,
         manifest,
         account,
         op,
         (hash) => {
           sent = hash;
-          setReviewSubmitted(hash);
+          if (epoch === generation.current) setReviewSubmitted(hash);
           if (op.method === "agentBridge") {
             try {
               setBridgeSources(saveBridgeSource(manifest, hash, op.details));
@@ -399,7 +432,7 @@ export default function App() {
               );
             }
           }
-          setBusy("Submitted · waiting for 2 confirmations…");
+          if (epoch === generation.current) setBusy("Submitted · waiting for 2 confirmations…");
           setActivity((a) => [
             {
               title: op.title,
@@ -413,6 +446,12 @@ export default function App() {
             ...a,
           ]);
         },
+        { onClaimed: (intent) => {
+          if (epoch === generation.current) setReviewIntentId(intent.id);
+        }, assertCurrent: () => {
+          if (epoch !== generation.current || window.ethereum !== provider)
+            throw Error("Wallet changed since review. Reconnect and review again.");
+        } },
       );
       if (op.method === "agentBridge" && sent) {
         try {
@@ -423,7 +462,6 @@ export default function App() {
           );
         }
       }
-      if (epoch !== generation.current) return;
       setActivity((a) =>
         a.map((row) =>
           row.hash === sent
@@ -437,17 +475,21 @@ export default function App() {
             : row,
         ),
       );
+      if (epoch !== generation.current) return;
       setReview(undefined);
       await refresh(manifest, account);
     } catch (e) {
       const message = explain(e);
-      setError(message);
+      if (epoch === generation.current) setError(message);
+      let reverted = false;
+      try { reverted = !!sent && readIntents().some((intent) => intent.hash === sent && intent.status === "reverted"); }
+      catch { /* Unavailable storage cannot establish a confirmed revert. */ }
       if (sent && op.method === "agentBridge") {
         try {
           setBridgeSources(
             updateBridgeSource(
               sent,
-              /reverted/i.test(message)
+              reverted
                 ? "Source reverted"
                 : "Receipt unresolved",
             ),
@@ -462,7 +504,7 @@ export default function App() {
             row.hash === sent
               ? {
                   ...row,
-                  status: /reverted/i.test(message)
+                  status: reverted
                     ? "Reverted"
                     : "Receipt unresolved",
                   error: message,
@@ -471,8 +513,29 @@ export default function App() {
           ),
         );
     } finally {
-      setBusy("");
+      if (epoch === generation.current) setBusy("");
     }
+  }
+  function onReconciled(intent: PublicIntent) {
+    setActivity((rows) => rows.map((row) => row.hash === intent.hash ? {
+      ...row, error: undefined,
+      status: intent.status === "reverted" ? "Reverted" : intent.queueId !== undefined ? "Queued · owner approval" : "Confirmed",
+    } : row));
+    try {
+      if (intent.kind === "source" && intent.hash && intent.to) {
+        saveBridgeSource({ chainId: intent.chainId, vault: intent.to, runtimeCodeHash: intent.meta.vaultRuntimeHash as Hex, securityVersion: 1, assets: [] }, intent.hash, {
+          Amount: intent.meta.amount ?? "", Recipient: intent.meta.recipient ?? "", "Destination domain": intent.meta.destinationDomain ?? "",
+        });
+        updateBridgeSource(intent.hash, intent.status === "reverted" ? "Source reverted" : "Source confirmed");
+      }
+      if (intent.kind === "mint" && intent.hash && intent.meta.sourceHash)
+        saveMintSource(intent.meta.sourceHash as Hex, intent.hash, intent.chainId, intent.status === "reverted" ? "Destination reverted" : "Destination confirmed");
+      setBridgeSources(readBridgeSources());
+    } catch {
+      setError(`Receipt verified. Keep transaction hash ${intent.hash}; the browser could not update its source transfer record.`);
+    }
+    if (manifest?.chainId === intent.chainId && manifest.vault.toLowerCase() === intent.to)
+      void refresh(manifest, account);
   }
   async function inspectReceipt(row: Activity) {
     setError("");
@@ -485,66 +548,10 @@ export default function App() {
       if (!accounts[0])
         throw Error("Connect your wallet on the original transaction network.");
       await verify(provider, row.deployment, accounts[0]);
-      const rpc = client(provider);
-      const receipt = await rpc.waitForTransactionReceipt({
-        hash: row.hash,
-        confirmations: 2,
-        timeout: 15000,
-      });
-      const tx = await rpc.getTransaction({ hash: row.hash });
-      if (
-        tx.to?.toLowerCase() !== row.deployment.vault.toLowerCase() ||
-        tx.input.toLowerCase() !== row.data.toLowerCase() ||
-        tx.from.toLowerCase() !== row.signer?.toLowerCase()
-      )
-        throw Error(
-          "Receipt transaction does not match the original reviewed request.",
-        );
-      if (receipt.transactionHash.toLowerCase() !== row.hash.toLowerCase())
-        throw Error(
-          "RPC returned a receipt for a different transaction. No success was recorded.",
-        );
-      let outcome = "Confirmed";
-      if (receipt.status === "reverted") outcome = "Reverted";
-      else {
-        validateReceipt(receipt, row.hash);
-        for (const log of receipt.logs) {
-          if (log.address.toLowerCase() !== row.deployment.vault.toLowerCase())
-            continue;
-          try {
-            const decoded = decodeEventLog({
-              abi: vaultAbi,
-              data: log.data,
-              topics: log.topics,
-            });
-            if (decoded.eventName === "TransactionQueued")
-              outcome = "Queued · owner approval";
-          } catch {
-            /* Unrelated protocol events do not change execution status. */
-          }
-        }
-      }
-      setActivity((a) =>
-        a.map((item) =>
-          item.hash === row.hash
-            ? { ...item, status: outcome, error: undefined }
-            : item,
-        ),
-      );
-      if (readBridgeSources().some((r) => r.hash === row.hash)) {
-        try {
-          setBridgeSources(
-            updateBridgeSource(
-              row.hash,
-              outcome === "Reverted" ? "Source reverted" : "Source confirmed",
-            ),
-          );
-        } catch {
-          /* Explorer hash remains available. */
-        }
-      }
-      if (manifest?.vault.toLowerCase() === row.deployment.vault.toLowerCase())
-        await refresh(manifest, account);
+      const original = readIntents().find((intent) => intent.hash === row.hash);
+      if (!original) throw Error("The original public recovery intent is required.");
+      const { intent } = await reconcileIntent(provider, original.id, row.hash);
+      onReconciled(intent);
     } catch (e) {
       setError(explain(e));
     } finally {
@@ -560,8 +567,11 @@ export default function App() {
   }
   async function formReview(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    const form = e.currentTarget;
+    const context: ReviewContext = { ...reviewContext(), form, values: formFingerprint(form) };
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
     setError("");
-    const f = new FormData(e.currentTarget);
+    const f = new FormData(form);
     const val = (key: string) => String(f.get(key) ?? "");
     try {
       if (!m) throw Error("Load your deployment manifest first.");
@@ -597,13 +607,15 @@ export default function App() {
         if (minutes < 1n)
           throw Error("Expiry must be between 1 and 30 minutes.");
         const deadline = BigInt(Math.floor(Date.now() / 1000)) + minutes * 60n;
-        if (!demo && window.ethereum) {
-          const pair = await client(window.ethereum).readContract({
+        if (!demo && context.provider) {
+          if (!currentReview(context)) return;
+          const pair = await client(context.provider).readContract({
             address: m.vault,
             abi: vaultAbi,
             functionName: "swapPairs",
             args: [input.address, output.address],
           });
+          if (!currentReview(context)) return;
           if (pair[0] === 0n || pair[1] < deadline)
             throw Error(
               "Owner pair floor is missing or expires before this trade. Ask the owner to configure it.",
@@ -660,13 +672,15 @@ export default function App() {
         const finality = integer(val("finality"), "Finality", 2000n);
         if (![1000n, 2000n].includes(finality))
           throw Error("Choose 1000 fast or 2000 standard finality.");
-        if (!demo && window.ethereum) {
-          const allowed = await client(window.ethereum).readContract({
+        if (!demo && context.provider) {
+          if (!currentReview(context)) return;
+          const allowed = await client(context.provider).readContract({
             address: m.vault,
             abi: vaultAbi,
             functionName: "bridgeDestinations",
             args: [Number(domain)],
           });
+          if (!currentReview(context)) return;
           if (allowed.toLowerCase() !== recipient.toLowerCase())
             throw Error(
               "Destination does not match the owner-approved bridge recipient.",
@@ -807,9 +821,10 @@ export default function App() {
             },
           );
       }
-      await prepare(op);
+      if (!currentReview(context)) return;
+      await prepare(op, opener, context);
     } catch (e) {
-      setError(explain(e));
+      if (currentReview(context)) setError(explain(e));
     }
   }
   function assetSelect(label = "Asset", name = "asset", native = true) {
@@ -828,6 +843,7 @@ export default function App() {
     );
   }
   async function getQuote() {
+    const epoch = generation.current;
     setError("");
     setQuote("");
     try {
@@ -840,7 +856,9 @@ export default function App() {
         !tradeForm.current
       )
         throw Error("Verify a deployment to request a real quote.");
-      const f = new FormData(tradeForm.current);
+      const form = tradeForm.current;
+      const fingerprint = tradeFingerprint(form);
+      const f = new FormData(form);
       const input = selectedAsset(f, "input"),
         output = selectedAsset(f, "output");
       if (input.address === output.address)
@@ -878,20 +896,23 @@ export default function App() {
       });
       const suggested = (received * 995n) / 1000n;
       const minimum = suggested > floor ? suggested : floor;
-      const el = tradeForm.current.elements.namedItem("minimum");
+      const block = await rpc.getBlockNumber();
+      if (epoch !== generation.current || tradeForm.current !== form ||
+        tradeFingerprint(form) !== fingerprint) return;
+      const el = form.elements.namedItem("minimum");
       if (el instanceof HTMLInputElement)
         el.value = formatUnits(minimum, output.decimals);
-      const block = await rpc.getBlockNumber();
       setQuote(
         `Simulated output: ${formatUnits(received, output.decimals)} ${output.symbol} · block ${block}. Suggested minimum allows up to 0.5% slippage, bounded by the owner floor. Quote can change before mining.`,
       );
     } catch (e) {
-      setError(explain(e));
+      if (epoch === generation.current) setError(explain(e));
     } finally {
-      setBusy("");
+      if (epoch === generation.current) setBusy("");
     }
   }
   async function inspectPending() {
+    const epoch = generation.current;
     setError("");
     try {
       if (!m || !window.ethereum || !verified)
@@ -903,9 +924,74 @@ export default function App() {
         functionName: "getPending",
         args: [id],
       });
-      setExtraPending({ id, ...p });
+      if (epoch !== generation.current) return;
+      setExtraPending({ chainId: m.chainId, vault: m.vault, pending: { id, ...p } });
     } catch (e) {
-      setError(explain(e));
+      if (epoch === generation.current) setError(explain(e));
+    }
+  }
+  async function reviewPending(
+    id: bigint,
+    method: "approvePending" | "cancelPending",
+  ) {
+    const epoch = generation.current;
+    const deployment = m;
+    const opener =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : undefined;
+    setError("");
+    setBusy("Reading the queued request before review…");
+    try {
+      if (!deployment || ownerDisabled)
+        throw Error(
+          "Verify this deployment with its owner before reviewing a request.",
+        );
+      let p: Pending;
+      if (demo) {
+        const example = pending.find((request) => request.id === id);
+        if (!example) throw Error("No demo request exists with that ID.");
+        p = example;
+      } else {
+        if (!account || !window.ethereum)
+          throw Error("Connect this deployment's owner before review.");
+        await verify(window.ethereum, deployment, account);
+        const fresh = await client(window.ethereum).readContract({
+          address: deployment.vault,
+          abi: vaultAbi,
+          functionName: "getPending",
+          args: [id],
+        });
+        p = { id, ...fresh };
+      }
+      if (epoch !== generation.current) return;
+      if (p.executed || p.cancelled)
+        throw Error(
+          "This request is already executed or cancelled. Refresh the pending list.",
+        );
+      await prepare(
+        operation(
+          method,
+          [id],
+          `${method === "approvePending" ? "Approve" : "Cancel"} request #${id}`,
+          {
+            Destination: p.to,
+            "Native value": `${formatUnits(p.value, 18)} ETH`,
+            Token: p.token,
+            "Token amount (raw)": String(p.amount),
+            "Queued calldata": p.data,
+            Effect:
+              method === "approvePending"
+                ? "One-time execution; the contract rechecks epoch, expiry and recipient policy"
+                : "This request can no longer execute",
+          },
+        ),
+        opener,
+      );
+    } catch (e) {
+      if (epoch === generation.current) setError(explain(e));
+    } finally {
+      if (epoch === generation.current) setBusy("");
     }
   }
   async function checkBridge() {
@@ -949,6 +1035,10 @@ export default function App() {
       setBusy("");
     }
   }
+  const inspected = verified && m && extraPending?.chainId === m.chainId &&
+    extraPending.vault.toLowerCase() === m.vault.toLowerCase()
+      ? extraPending.pending
+      : undefined;
   const pending = demo
     ? [
         {
@@ -968,9 +1058,9 @@ export default function App() {
       ]
     : [
         ...(snapshot?.pending ?? []),
-        ...(extraPending &&
-        !snapshot?.pending.some((p) => p.id === extraPending.id)
-          ? [extraPending]
+        ...(inspected &&
+        !snapshot?.pending.some((p) => p.id === inspected.id)
+          ? [inspected]
           : []),
       ];
   return (
@@ -1014,6 +1104,7 @@ export default function App() {
               onClick={() => {
                 setSection(s);
                 setError("");
+                setQuote("");
               }}
               aria-current={section === s ? "page" : undefined}
             >
@@ -1163,6 +1254,7 @@ export default function App() {
               {busy}
             </div>
           )}
+          {!demo && <IntentRecovery entries={journal.entries} storageError={journal.error} onReconciled={onReconciled} />}
           {section === "Overview" && (
             <>
               <div className="metric-grid">
@@ -1364,6 +1456,7 @@ export default function App() {
             <Suspense fallback={<p role="status">Loading deployment setup…</p>}>
               <Deploy
                 account={account}
+                session={generation.current}
                 onClose={() => setShowDeploy(false)}
                 onManifest={(next) => {
                   setManifest(next);
@@ -1452,6 +1545,7 @@ export default function App() {
                   onSubmit={formReview}
                   key={section}
                   ref={section === "Trading" ? tradeForm : undefined}
+                  onChange={section === "Trading" ? () => setQuote("") : undefined}
                 >
                   {section === "Payments" && (
                     <>
@@ -1571,7 +1665,7 @@ export default function App() {
                   <button
                     className="primary wide"
                     disabled={
-                      disabled ||
+                      writeBlocked ||
                       !!busy ||
                       (section !== "Payments" && assets.length === 0)
                     }
@@ -1734,6 +1828,7 @@ export default function App() {
               <Recovery
                 sourceManifest={manifest}
                 sourceHash={bridgeHash}
+                session={generation.current}
                 onRecordsChange={() => setBridgeSources(readBridgeSources())}
               />
             </Suspense>
@@ -1971,24 +2066,7 @@ export default function App() {
                       disabled={
                         ownerDisabled || !!busy || p.executed || p.cancelled
                       }
-                      onClick={() =>
-                        prepare(
-                          operation(
-                            "approvePending",
-                            [p.id],
-                            `Approve request #${p.id}`,
-                            {
-                              Destination: p.to,
-                              "Native value": `${formatUnits(p.value, 18)} ETH`,
-                              Token: p.token,
-                              "Token amount (raw)": String(p.amount),
-                              "Queued calldata": p.data,
-                              Effect:
-                                "One-time execution; the contract rechecks epoch, expiry and recipient policy",
-                            },
-                          ),
-                        )
-                      }
+                      onClick={() => reviewPending(p.id, "approvePending")}
                     >
                       Review approval →
                     </button>
@@ -1997,16 +2075,7 @@ export default function App() {
                       disabled={
                         ownerDisabled || !!busy || p.executed || p.cancelled
                       }
-                      onClick={() =>
-                        prepare(
-                          operation(
-                            "cancelPending",
-                            [p.id],
-                            `Cancel request #${p.id}`,
-                            { Effect: "This request can no longer execute" },
-                          ),
-                        )
-                      }
+                      onClick={() => reviewPending(p.id, "cancelPending")}
                     >
                       Review cancellation
                     </button>
@@ -2044,7 +2113,7 @@ export default function App() {
                   <h3>No transactions this session</h3>
                   <p>
                     Transactions appear here after your wallet submits them.
-                    Nothing is persisted between sessions.
+                    Public transaction identities and unresolved requests remain in Wallet request recovery after reload.
                   </p>
                 </div>
               ) : (
@@ -2062,14 +2131,13 @@ export default function App() {
                     >
                       {a.status}
                     </span>
-                    {(a.status === "Submitted" ||
-                      a.status === "Receipt unresolved") && (
+                    {a.hash && (
                       <button
                         className="secondary"
                         onClick={() => inspectReceipt(a)}
                         disabled={!!busy}
                       >
-                        Check receipt ↻
+                        {a.status === "Submitted" || a.status === "Receipt unresolved" ? "Check receipt ↻" : "Recheck receipt ↻"}
                       </button>
                     )}
                     {a.hash && a.deployment && (
@@ -2172,11 +2240,11 @@ export default function App() {
               ))}
               <div>
                 <dt>Contract</dt>
-                <dd>{m?.vault}</dd>
+                <dd>{review.binding.vault}</dd>
               </div>
               <div>
                 <dt>Signer</dt>
-                <dd>{demo ? `Demo ${role}` : `${account} (${role})`}</dd>
+                <dd>{demo ? `Demo ${role}` : `${review.binding.signer} (${role})`}</dd>
               </div>
               <div>
                 <dt>Network fee</dt>
@@ -2192,9 +2260,9 @@ export default function App() {
               <pre>{review.data}</pre>
             </details>
             {busy && <p role="status">{busy}</p>}
-            {reviewSubmitted && (
+            {reviewedHash && (
               <p className="form-note">
-                Transaction submitted: {reviewSubmitted}. Signing this review
+                Transaction submitted: {reviewedHash}. Signing this review
                 again is disabled. Inspect the receipt in Activity before
                 another write.
               </p>
@@ -2214,7 +2282,7 @@ export default function App() {
               </button>
               <button
                 className="primary"
-                disabled={demo || !!busy || !!reviewSubmitted}
+                disabled={demo || !!busy || !!reviewedHash || reviewSpent || journal.blocked}
                 onClick={confirm}
               >
                 Confirm in wallet ↗

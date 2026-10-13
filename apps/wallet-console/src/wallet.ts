@@ -3,8 +3,6 @@ import {
   custom,
   encodeFunctionData,
   keccak256,
-  toHex,
-  decodeEventLog,
   formatUnits,
   type Address,
   type Hex,
@@ -17,6 +15,9 @@ import {
   type Manifest,
   type Role,
 } from "./security";
+import {
+  broadcastIntent, reconcileIntent, walletRejected, type IntentMeta, type PublicIntent,
+} from "./intents";
 export type Provider = EIP1193Provider;
 declare global {
   interface Window {
@@ -29,6 +30,32 @@ export interface Operation {
   title: string;
   details: Record<string, string>;
   ownerOnly?: boolean;
+}
+export interface PreparedOperation extends Operation {
+  readonly binding: Readonly<{
+    chainId: number;
+    vault: Address;
+    runtimeCodeHash: Hex;
+    signer: Address;
+    dataHash: Hex;
+    provider?: Provider;
+  }>;
+}
+export function bindOperation(op: Operation, manifest: Manifest, signer: Address, provider?: Provider): PreparedOperation {
+  return Object.freeze({
+    ...op, details: Object.freeze({ ...op.details }),
+    binding: Object.freeze({ chainId: manifest.chainId, vault: manifest.vault,
+      runtimeCodeHash: manifest.runtimeCodeHash, signer, dataHash: keccak256(op.data), provider }),
+  });
+}
+function assertPrepared(op: PreparedOperation, manifest: Manifest, signer: Address, provider: Provider) {
+  const original = op.binding;
+  if (!original || original.chainId !== manifest.chainId ||
+    original.vault.toLowerCase() !== manifest.vault.toLowerCase() ||
+    original.runtimeCodeHash.toLowerCase() !== manifest.runtimeCodeHash.toLowerCase() ||
+    original.signer.toLowerCase() !== signer.toLowerCase() || original.provider !== provider ||
+    original.dataHash !== keccak256(op.data))
+    throw Error("The reviewed deployment, signer or prepared transaction context changed. Start a fresh review before signing.");
 }
 export interface Pending {
   id: bigint;
@@ -205,13 +232,21 @@ export async function load(
   );
   const pending: Pending[] = [];
   const start = pendingTotal > 50n ? pendingTotal - 50n : 0n;
-  for (let id = start; id < pendingTotal; id++) {
-    const p = await rpc.readContract({
-      ...base,
-      functionName: "getPending",
-      args: [id],
-    });
-    if (!p.executed && !p.cancelled) pending.push({ id, ...p });
+  for (let first = start; first < pendingTotal; first += 5n) {
+    const size = Number(pendingTotal - first < 5n ? pendingTotal - first : 5n);
+    const group = await Promise.all(
+      Array.from({ length: size }, async (_, offset) => {
+        const id = first + BigInt(offset);
+        const p = await rpc.readContract({
+          ...base,
+          functionName: "getPending",
+          args: [id],
+        });
+        return { id, ...p };
+      }),
+    );
+    for (const p of group)
+      if (!p.executed && !p.cancelled) pending.push(p);
   }
   return {
     account,
@@ -267,10 +302,14 @@ export async function submit(
   provider: Provider,
   manifest: Manifest,
   account: Address,
-  op: Operation,
+  op: PreparedOperation,
   onSubmitted: (hash: Hex) => void,
+  options: { kind?: "mint"; meta?: IntentMeta; assertCurrent?: () => void; onClaimed?: (intent: PublicIntent) => void } = {},
 ): Promise<{ hash: Hex; queuedId?: bigint }> {
+  assertPrepared(op, manifest, account, provider);
+  options.assertCurrent?.();
   const { role } = await verify(provider, manifest, account);
+  options.assertCurrent?.();
   allowWrite(role, op.method, true, false);
   const rpc = client(provider);
   const paused = await rpc.readContract({
@@ -281,51 +320,37 @@ export async function submit(
   if (paused && op.method.startsWith("agent"))
     throw Error("Vault is paused. Only owner controls are available.");
   await rpc.call({ account, to: manifest.vault, data: op.data });
+  options.assertCurrent?.();
   const gas = await rpc.estimateGas({
     account,
     to: manifest.vault,
     data: op.data,
   });
-  // External wallet controls signing. Application never sees a private key or signature.
-  const hash = await provider.request({
-    method: "eth_sendTransaction",
-    params: [
-      {
-        from: account,
-        to: manifest.vault,
-        data: op.data,
-        gas: toHex(gas),
-        chainId: toHex(manifest.chainId),
-      },
-    ],
-  });
-  onSubmitted(hash);
-  const receipt = await rpc.waitForTransactionReceipt({
-    hash,
-    confirmations: 2,
-    timeout: 180000,
-  });
+  assertPrepared(op, manifest, account, provider);
+  options.assertCurrent?.();
+  // Persist the public reviewed identity before asking the external wallet to sign.
+  // A lost provider response cannot establish that no transaction was broadcast.
+  const { hash, intentId } = await broadcastIntent(provider, {
+    kind: options.kind ?? (op.method === "agentBridge" ? "source" : "vault"),
+    chainId: manifest.chainId, from: account, to: manifest.vault,
+    data: op.data, gas, label: op.title,
+    meta: {
+      vaultRuntimeHash: manifest.runtimeCodeHash,
+      ...(op.details.Amount ? { amount: op.details.Amount } : {}),
+      ...(op.details.Recipient ? { recipient: op.details.Recipient } : {}),
+      ...(op.details["Destination domain"] ? { destinationDomain: op.details["Destination domain"] } : {}),
+      ...options.meta,
+    },
+    assertCurrent: options.assertCurrent,
+    onClaimed: options.onClaimed,
+  }, onSubmitted);
+  const { receipt, intent } = await reconcileIntent(provider, intentId, hash);
   validateReceipt(receipt, hash);
-  let queuedId: bigint | undefined;
-  for (const log of receipt.logs) {
-    if (log.address.toLowerCase() !== manifest.vault.toLowerCase()) continue;
-    try {
-      const decoded = decodeEventLog({
-        abi: vaultAbi,
-        data: log.data,
-        topics: log.topics,
-      });
-      if (decoded.eventName === "TransactionQueued")
-        queuedId = decoded.args.txId;
-    } catch {
-      /* Other contracts may emit unrelated events. */
-    }
-  }
-  return { hash, queuedId };
+  return { hash, ...(intent.queueId !== undefined ? { queuedId: BigInt(intent.queueId) } : {}) };
 }
 export function explain(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error);
-  if (/reject|denied|4001/i.test(raw))
+  if (walletRejected(error))
     return "Wallet request declined. No transaction was sent.";
   return raw.length > 650 ? raw.slice(0, 650) + "…" : raw;
 }

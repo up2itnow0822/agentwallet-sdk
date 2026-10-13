@@ -42,6 +42,8 @@ export interface GuardedPaymentMerchantConfig<
   readonly confirmations: number;
   readonly durableDirectory: string;
   readonly challengeTtlMs?: number;
+  /** Confirmation/proof window after mining: at least 30 seconds per required confirmation, at most 24 hours. */
+  readonly proofTtlMs?: number;
 }
 export interface VerifiedGuardedPayment {
   readonly protocol: typeof GUARDED_TRANSACTION_SCHEME;
@@ -151,6 +153,8 @@ function decodeProof(header: string): PaymentProof {
       "resource",
       "requestId",
       "expiresAt",
+      "confirmations",
+      "proofExpiresAt",
     ]) ||
     p.scheme !== GUARDED_TRANSACTION_SCHEME ||
     typeof p.network !== "string" ||
@@ -164,7 +168,14 @@ function decodeProof(header: string): PaymentProof {
     typeof p.resource !== "string" ||
     typeof p.requestId !== "string" ||
     !/^[A-Za-z0-9_-]{16,128}$/.test(p.requestId) ||
-    !Number.isSafeInteger(p.expiresAt)
+    !Number.isSafeInteger(p.expiresAt) ||
+    Number(p.expiresAt) <= 0 ||
+    !Number.isSafeInteger(p.confirmations) ||
+    Number(p.confirmations) < 1 ||
+    Number(p.confirmations) > 64 ||
+    !Number.isSafeInteger(p.proofExpiresAt) ||
+    Number(p.proofExpiresAt) < Number(p.expiresAt) + 30000 * Number(p.confirmations) ||
+    Number(p.proofExpiresAt) > Number(p.expiresAt) + 86400000
   )
     throw new Error("Invalid merchant accepted payment details");
   assertPositiveAmount(BigInt(p.amount));
@@ -188,6 +199,7 @@ export class GuardedPaymentMerchant<
   private readonly config: GuardedPaymentMerchantConfig;
   private readonly store: MerchantSettlementStore;
   private readonly ttl: number;
+  private readonly proofTtl: number;
   constructor(config: GuardedPaymentMerchantConfig<TChain>) {
     const origin = new URL(config.origin),
       resource = new URL(config.resource);
@@ -227,6 +239,9 @@ export class GuardedPaymentMerchant<
     this.ttl = config.challengeTtlMs ?? 120000;
     if (!Number.isSafeInteger(this.ttl) || this.ttl < 1000 || this.ttl > 300000)
       throw new Error("Invalid merchant challenge lifetime");
+    this.proofTtl = config.proofTtlMs ?? 3600000;
+    if (!Number.isSafeInteger(this.proofTtl) || this.proofTtl < 30000 * config.confirmations || this.proofTtl > 86400000)
+      throw new Error("Invalid merchant confirmation/proof lifetime");
     this.config = Object.freeze({
       ...config,
       publicClient: config.publicClient as unknown as PublicClient,
@@ -281,7 +296,9 @@ export class GuardedPaymentMerchant<
       payTo: this.config.recipient,
       resource: this.config.resource,
       requestId: randomUUID(),
+      confirmations: this.config.confirmations,
       expiresAt: now + this.ttl,
+      proofExpiresAt: now + this.ttl + this.proofTtl,
     });
     this.store.issue(
       Object.freeze({
@@ -315,6 +332,9 @@ export class GuardedPaymentMerchant<
       proof.accepted.amount !== payment.amount ||
       BigInt(payment.amount) !== this.config.amount ||
       proof.accepted.expiresAt !== payment.expiresAt ||
+      proof.accepted.confirmations !== payment.confirmations ||
+      payment.confirmations !== this.config.confirmations ||
+      proof.accepted.proofExpiresAt !== payment.proofExpiresAt ||
       Date.now() < challenge.issuedAt
     )
       throw new Error(
@@ -358,6 +378,9 @@ export class GuardedPaymentMerchant<
         asset: payment.asset,
         payTo: payment.payTo,
         amount: BigInt(payment.amount),
+        confirmations: BigInt(payment.confirmations),
+        expiresAt: BigInt(payment.expiresAt),
+        proofExpiresAt: BigInt(payment.proofExpiresAt),
       },
       signature: proof.payload.signature,
     });

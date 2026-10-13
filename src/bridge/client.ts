@@ -52,7 +52,7 @@ export class BridgeModule {
         }
         this.config = { ...config, destinations: { ...config.destinations }, maxAttestationPolls: polls, attestationPollIntervalMs: interval };
     }
-    private async preflight(toChain: BridgeChain): Promise<DestinationClients> {
+    private async preflight(toChain: BridgeChain, requireGas = true): Promise<DestinationClients> {
         if (!Object.hasOwn(CCTP_DOMAIN_IDS, toChain) || toChain === this.fromChain) {
             throw new BridgeError("UNSUPPORTED_CHAIN", "Source and supported destination chains must differ");
         }
@@ -76,10 +76,37 @@ export class BridgeModule {
         if (domain !== CCTP_DOMAIN_IDS[toChain]) {
             throw new Error("Destination CCTP domain mismatch");
         }
-        if (await publicClient.getBalance({ address: walletClient.account!.address }) === 0n) {
+        if (requireGas && await publicClient.getBalance({ address: walletClient.account!.address }) === 0n) {
             throw new Error("Destination gas signer has no native gas balance");
         }
         return destination;
+    }
+    private receiptHash(receipt: TransactionReceipt, expected: Hex): void {
+        hash(receipt.transactionHash);
+        if (receipt.transactionHash.toLowerCase() !== expected.toLowerCase()) {
+            throw new Error('Transaction was replaced; its receipt is not evidence for the saved bridge submission');
+        }
+    }
+    private async mintReceipt(record: BridgeRecord, publicClient: DestinationClients['publicClient'], txHash: Hex): Promise<TransactionReceipt> {
+        try {
+            const confirmations = this.wallet.confirmations;
+            if (!Number.isSafeInteger(confirmations) || confirmations < 1 || confirmations > 64) {
+                throw new Error('Invalid bridge confirmation count');
+            }
+            const receipt = await publicClient.waitForTransactionReceipt({hash:txHash,confirmations});
+            this.receiptHash(receipt, txHash);
+            if (receipt.status !== 'success' && receipt.status !== 'reverted') {
+                throw new Error('Unknown mint receipt status');
+            }
+            if (receipt.status === 'success') {
+                const nonce = messageNonce(validateMessage(record, record.message, true));
+                const used = await publicClient.readContract({address:MESSAGE_TRANSMITTER_V2[record.toChain],abi:MessageTransmitterV2Abi,functionName:'usedNonces',args:[nonce]});
+                if (used !== 1n) throw new Error('Successful mint receipt did not consume the saved CCTP nonce; reconcile before retrying');
+            }
+            return receipt;
+        } catch (error) {
+            throw new BridgeError('MINT_RECOVERY','Mint receipt requires reconciliation; retain the original submission hash',record.id,{cause:error},txHash);
+        }
     }
     private validateRecord(record: BridgeRecord) {
         const fields = ['version', 'id', 'vault', 'fromChain', 'toChain', 'recipient', 'amount', 'maxFee', 'minFinalityThreshold', 'createdAt', 'status', 'burnTxHash', 'sourceMessage', 'message', 'attestation', 'nonce', 'mintTxHash'];
@@ -190,6 +217,7 @@ export class BridgeModule {
                     await this.config.store.save(record);
                 } });
             record = Object.freeze({ ...record, burnTxHash: result.txHash });
+            this.receiptHash(result.receipt, result.txHash);
             const sourceMessage = this.extract(record, result.receipt);
             record = Object.freeze({ ...record, status: "burned", sourceMessage });
             await this.config.store.save(record);
@@ -210,14 +238,17 @@ export class BridgeModule {
             if (record.burnTxHash && txHash && record.burnTxHash.toLowerCase() !== txHash.toLowerCase()) {
                 throw new Error("Burn recovery hash mismatch");
             }
-            const receipt = await this.wallet.publicClient.waitForTransactionReceipt({ hash: burnHash });
-            if (receipt.status !== "success") {
-                throw new Error("Burn transaction reverted");
+            try {
+                const receipt = await this.wallet.publicClient.waitForTransactionReceipt({hash:burnHash,confirmations:this.wallet.confirmations});
+                this.receiptHash(receipt, burnHash);
+                if (receipt.status !== 'success') throw new Error('Burn transaction reverted');
+                const sourceMessage = this.extract(record, receipt);
+                record = Object.freeze({...record,burnTxHash:burnHash,sourceMessage,status:'burned'});
+                await this.config.store.save(record);
+                return record;
+            } catch(error) {
+                throw new BridgeError('BURN_RECOVERY','Source receipt requires reconciliation; retain the original burn hash',record.id,{cause:error},burnHash);
             }
-            const sourceMessage = this.extract(record, receipt);
-            record = Object.freeze({ ...record, burnTxHash: burnHash, sourceMessage, status: "burned" });
-            await this.config.store.save(record);
-            return record;
         });
     }
     async bridge(value: bigint, toChain: BridgeChain, options: BridgeOptions) {
@@ -312,13 +343,14 @@ export class BridgeModule {
             txHash = await walletClient.writeContract({ ...simulation.request, account: walletClient.account!, chain: walletClient.chain! });
             record = Object.freeze({ ...record, status: "mint-submitted", mintTxHash: txHash });
             await this.config.store.save(record);
-            const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+            const receipt = await this.mintReceipt(record, publicClient, txHash);
             if (receipt.status !== "success") {
                 throw new Error("Mint reverted; reconcile before retrying");
             }
             record = Object.freeze({ ...record, status: "minted" });
             await this.config.store.save(record);
         } catch (error) {
+            if (error instanceof BridgeError && error.txHash === txHash) throw error;
             throw new BridgeError("MINT_RECOVERY", "Mint was submitted; retain its hash and reconcile before retrying", record.id, {cause: error}, txHash);
         }
         return record;
@@ -335,7 +367,7 @@ export class BridgeModule {
     async recoverMint(id: string, submittedHash?: Hex): Promise<BridgeRecord> {
         return this.config.store.withLock(id, async () => {
             let record = await this.load(id);
-            if (record.status !== "mint-submitted" && !(["attested", "mint-submitting"].includes(record.status) && submittedHash)) {
+            if (!["mint-submitted", "minted"].includes(record.status) && !(["attested", "mint-submitting"].includes(record.status) && submittedHash)) {
                 throw new Error("Only a submitted mint can be reconciled");
             }
             const txHash = record.mintTxHash ?? submittedHash;
@@ -343,7 +375,7 @@ export class BridgeModule {
             if (record.mintTxHash && submittedHash && record.mintTxHash.toLowerCase() !== submittedHash.toLowerCase()) {
                 throw new Error("Mint recovery hash mismatch");
             }
-            const destination = await this.preflight(record.toChain);
+            const destination = await this.preflight(record.toChain, false);
             if (!record.mintTxHash) {
                 const message = validateMessage(record, record.message, true);
                 const attestation = validateAttestation(record.attestation);
@@ -355,7 +387,7 @@ export class BridgeModule {
                 record = Object.freeze({...record, status: "mint-submitted", mintTxHash: txHash});
                 await this.config.store.save(record);
             }
-            const receipt = await destination.publicClient.waitForTransactionReceipt({ hash: txHash });
+            const receipt = await this.mintReceipt(record, destination.publicClient, txHash);
             if (receipt.status === "success") {
                 record = Object.freeze({ ...record, status: "minted" });
             }
@@ -369,17 +401,21 @@ export class BridgeModule {
         return this.config.store.withLock(id, async () => {
             let record = await this.load(id);
             if (record.status === "minted") {
+                const destination = await this.preflight(record.toChain, false);
+                hash(record.mintTxHash);
+                const receipt = await this.mintReceipt(record, destination.publicClient, record.mintTxHash);
+                if (receipt.status !== 'success') throw new BridgeError('MINT_RECOVERY','Previously recorded mint reverted; reconcile its original hash',record.id,undefined,record.mintTxHash);
                 return record;
             }
             if (record.status === "mint-submitting") {
                 throw new BridgeError("MINT_RECOVERY", "Mint broadcast outcome is unknown; reconcile its hash before retrying", id);
             }
             if (record.status === "mint-submitted") {
-                const destination = await this.preflight(record.toChain);
+                const destination = await this.preflight(record.toChain, false);
                 hash(record.mintTxHash);
-                const receipt = await destination.publicClient.waitForTransactionReceipt({ hash: record.mintTxHash });
+                const receipt = await this.mintReceipt(record, destination.publicClient, record.mintTxHash);
                 if (receipt.status !== "success") {
-                    throw new Error("Previous mint reverted; explicit mint recovery is required");
+                    throw new BridgeError('MINT_RECOVERY','Previous mint reverted; explicit mint recovery is required',record.id,undefined,record.mintTxHash);
                 }
                 record = Object.freeze({ ...record, status: "minted" });
                 await this.config.store.save(record);

@@ -51,7 +51,13 @@
     "dist",
     "contracts/AgentVault.sol",
     "SECURITY.md",
+    "CONTRIBUTING.md",
     "docs/migration.md",
+    "src/identity/MIGRATION.md",
+    "docs/security/threat-model.md",
+    "docs/security/remediation.md",
+    "docs/security/release-readiness.md",
+    "docs/security/ci-evaluation.md",
     "LICENSE"
   ],
   "scripts": {

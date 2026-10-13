@@ -23,6 +23,7 @@ Use current primary protocol documentation. Default to deny for spending, origin
 ## Verification
 Baseline: npm test (17 unique source tests, duplicated to 34 by the old configuration); TypeScript. Required release verification evolves with implementation: strict typecheck, source-only regression suite, real local-EVM contract adversarial tests, UI build/browser flow, packed npm artifact smoke test, full and production npm audits, secret scan, and fresh independent review. Live testnet and independent deployed-contract audit are separate release gates.
 CI uses frozen installs without lifecycle scripts, pinned action revisions, read-only repository permissions and a single strict npm run verify gate. No check may swallow a failing command. tmp is explicitly overridden to its audited patched 0.2.7 release.
+The user's bounded rerun request applies to PR #9: at most ten concrete evaluated candidates. Inspect nonempty current-head checks, all actionable review threads/review bodies/conversation comments, and fresh repair evidence before stopping early. Passing CI does not erase known review defects; an unavailable external review bot is not an approval. Record cycles in docs/security/ci-evaluation.md without counting focused regressions, polls or stale-head cancellation as new cycles. The packed release must include its linked contribution, migration, identity and security guides.
 
 ## Child DOX Index
 - src/AGENTS.md: SDK and integration contracts.

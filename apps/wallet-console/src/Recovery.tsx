@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { formatUnits, encodeFunctionData, type Hex } from "viem";
+import { formatUnits, type Hex } from "viem";
 import {
   sourceRecord,
   attest,
@@ -8,10 +8,8 @@ import {
   destinationChecks,
   type RecoveryDraft,
 } from "./recovery";
-import { type Manifest, validateReceipt } from "./security";
-import { submit, explain } from "./wallet";
-import { erc20Abi, vaultAbi } from "./abi";
-import { MessageTransmitterV2Abi } from "../../../src/bridge/abis";
+import { type Manifest } from "./security";
+import { submit, explain, type Provider } from "./wallet";
 import { messageNonce } from "../../../src/bridge/message";
 import { USDC_CONTRACT, type BridgeRecord } from "../../../src/bridge/types";
 import {
@@ -20,63 +18,73 @@ import {
   updateBridgeSource,
   saveMintSource,
 } from "./bridgeRecords";
+import { useReviewDialog } from "./useReviewDialog";
+import { useIntents } from "./useIntents";
+import { assertNoUnresolvedIntent, readIntents, reconcileIntent } from "./intents";
+interface ReviewedMint extends RecoveryDraft {
+  session: number;
+  provider: Provider;
+  sourceIdentity: string;
+  destinationIdentity: string;
+}
 export default function Recovery({
   sourceManifest,
   sourceHash,
+  session,
   onRecordsChange,
 }: {
   sourceManifest?: Manifest;
   sourceHash: string;
+  session: number;
   onRecordsChange: () => void;
 }) {
+  const journal = useIntents();
   const [destinationText, setDestinationText] = useState(""),
     [record, setRecord] = useState<BridgeRecord>(),
-    [draft, setDraft] = useState<RecoveryDraft>(),
+    [draft, setDraft] = useState<ReviewedMint>(),
     [status, setStatus] = useState(""),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(""),
     [mintHash, setMintHash] = useState<Hex>(),
+    [mintIntentId, setMintIntentId] = useState<string>(),
     [mintLocked, setMintLocked] = useState(false);
   const modal = useRef<HTMLDivElement>(null);
+  const ownIntent = journal.entries.find((intent) => intent.id === mintIntentId);
+  const spent = !!mintIntentId && ownIntent?.status !== "rejected";
+  const current = useRef({ session, sourceHash, destinationText });
+  current.current = { session, sourceHash, destinationText };
+  useEffect(() => {
+    setDraft(undefined);
+    setBusy("");
+  }, [session]);
   useEffect(() => {
     setRecord(undefined);
     setDraft(undefined);
     setStatus("");
     setError("");
     setMintHash(undefined);
+    setMintIntentId(undefined);
     setMintLocked(false);
   }, [sourceHash]);
   useEffect(() => {
-    if (!draft) return;
-    modal.current?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !busy) setDraft(undefined);
-      if (e.key === "Tab") {
-        const nodes = modal.current?.querySelectorAll<HTMLElement>(
-          "button:not(:disabled)",
-        );
-        if (!nodes?.length) return;
-        const first = nodes[0],
-          last = nodes[nodes.length - 1];
-        if (e.shiftKey && document.activeElement === first) {
-          e.preventDefault();
-          last.focus();
-        } else if (!e.shiftKey && document.activeElement === last) {
-          e.preventDefault();
-          first.focus();
-        }
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [draft, busy]);
+    const original = journal.entries.find((intent) => intent.kind === "mint" && intent.meta.sourceHash === sourceHash.toLowerCase());
+    if (original) {
+      setMintHash(original.hash);
+      setMintLocked(original.status === "unknown" || original.status === "confirmed");
+    }
+  }, [journal.entries, sourceHash]);
+  const rememberReviewOpener = useReviewDialog(modal, !!draft, !!busy, () => setDraft(undefined));
   async function fetchAttestation() {
+    const epoch = session;
+    const sourceIdentity = sourceHash;
+    const provider = window.ethereum;
+    const active = () => epoch === current.current.session && sourceIdentity === current.current.sourceHash && window.ethereum === provider;
     setError("");
     setStatus("");
     setBusy("Checking the original burn and Circle attestation…");
     try {
       if (
-        !window.ethereum ||
+        !provider ||
         !sourceManifest ||
         !/^0x[\da-f]{64}$/i.test(sourceHash)
       )
@@ -89,10 +97,11 @@ export default function Recovery({
         source.burnTxHash?.toLowerCase() !== sourceHash.toLowerCase()
       )
         source = await sourceRecord(
-          window.ethereum,
+          provider,
           sourceManifest,
           sourceHash as Hex,
         );
+      if (!active()) return;
       setRecord(source);
       const stored = readBridgeSources().find(
         (r) => r.hash.toLowerCase() === sourceHash.toLowerCase(),
@@ -117,6 +126,7 @@ export default function Recovery({
         }
       }
       const attested = await attest(source);
+      if (!active()) return;
       if (!attested) {
         setStatus(
           "Circle attestation pending. Keep the original burn hash and check again later; do not burn again.",
@@ -128,49 +138,69 @@ export default function Recovery({
         "Matching Circle attestation available. Import a verified destination manifest, switch the external wallet to that network, then review receiving.",
       );
     } catch (e) {
-      setError(explain(e));
+      if (active()) setError(explain(e));
     } finally {
-      setBusy("");
+      if (active()) setBusy("");
     }
   }
   async function review() {
+    const epoch = session;
+    const sourceIdentity = sourceHash;
+    const destinationIdentity = destinationText;
+    const provider = window.ethereum;
+    const active = () => epoch === current.current.session && sourceIdentity === current.current.sourceHash && destinationIdentity === current.current.destinationText && window.ethereum === provider;
+    rememberReviewOpener();
     setError("");
     setBusy("Verifying destination and simulating the mint…");
     try {
-      if (!record?.message || !window.ethereum)
+      assertNoUnresolvedIntent();
+      if (!record?.message || !provider)
         throw Error("Fetch a matching Circle attestation first.");
       if (mintLocked)
         throw Error(
           "A destination mint was already submitted. Check its receipt before any further action.",
         );
       const destination = parseRecoveryManifest(destinationText);
-      const accounts = await window.ethereum.request({
+      const accounts = await provider.request({
         method: "eth_accounts",
       });
       if (!accounts[0]) throw Error("Connect the destination owner wallet.");
-      setDraft(
-        await prepareMint(window.ethereum, destination, record, accounts[0]),
-      );
+      const prepared = await prepareMint(provider, destination, record, accounts[0]);
+      if (active()) {
+        setMintIntentId(undefined);
+        setDraft({ ...prepared, session: epoch, provider, sourceIdentity, destinationIdentity });
+      }
     } catch (e) {
-      setError(explain(e));
+      if (active()) setError(explain(e));
     } finally {
-      setBusy("");
+      if (active()) setBusy("");
     }
   }
   async function confirm() {
-    if (!draft || !window.ethereum) return;
+    if (!draft || !window.ethereum || spent || journal.blocked) return;
+    const epoch = draft.session;
+    const provider = draft.provider;
+    const sourceIdentity = draft.sourceIdentity;
+    const destinationIdentity = draft.destinationIdentity;
+    const assertCurrent = () => {
+      if (epoch !== current.current.session || sourceIdentity !== current.current.sourceHash || destinationIdentity !== current.current.destinationText || provider !== window.ethereum)
+        throw Error("Wallet or transfer changed since receiving review. Reconnect and review again.");
+    };
     let sent: Hex | undefined;
     setBusy("Confirm receiving in your external wallet…");
     setError("");
     try {
-      const { rpc, transmitter, message } = await destinationChecks(
-        window.ethereum,
+      assertCurrent();
+      const { transmitter, message } = await destinationChecks(
+        provider,
         draft.destination,
         draft.record,
         draft.account,
       );
+      const executedFee = BigInt("0x" + message.slice(2 + 312 * 2, 2 + 344 * 2));
+      const expected = BigInt(draft.record.amount) - executedFee;
       await submit(
-        window.ethereum,
+        provider,
         draft.destination.manifest,
         draft.account,
         draft.op,
@@ -193,29 +223,13 @@ export default function Recovery({
             );
           }
         },
+        { kind: "mint", assertCurrent, onClaimed: (intent) => setMintIntentId(intent.id), meta: {
+          sourceHash: draft.record.burnTxHash!, mintNonce: messageNonce(message),
+          token: USDC_CONTRACT[draft.record.toChain], transmitter,
+          transmitterHash: draft.destination.transmitterHash,
+          balanceBefore: String(draft.balanceBefore), expectedCredit: String(expected),
+        } },
       );
-      const [used, balance] = await Promise.all([
-        rpc.readContract({
-          address: transmitter,
-          abi: MessageTransmitterV2Abi,
-          functionName: "usedNonces",
-          args: [messageNonce(message)],
-        }),
-        rpc.readContract({
-          address: USDC_CONTRACT[draft.record.toChain],
-          abi: erc20Abi,
-          functionName: "balanceOf",
-          args: [draft.destination.manifest.vault],
-        }),
-      ]);
-      const executedFee = BigInt(
-        "0x" + message.slice(2 + 312 * 2, 2 + 344 * 2),
-      );
-      const expected = BigInt(draft.record.amount) - executedFee;
-      if (used === 0n || balance < draft.balanceBefore + expected)
-        throw Error(
-          "Destination receipt succeeded, but CCTP nonce or vault credit could not be verified. Keep the hash and inspect before retrying.",
-        );
       if (sent) {
         try {
           saveMintSource(
@@ -232,12 +246,14 @@ export default function Recovery({
       setStatus(
         `Destination received ${formatUnits(expected, 6)} USDC in the verified vault. Nonce consumed; receipt confirmed twice.`,
       );
-      setDraft(undefined);
+      if (epoch === current.current.session) setDraft(undefined);
     } catch (e) {
       const message = explain(e);
       setError(message);
       if (sent) {
-        const reverted = /Transaction reverted on-chain/.test(message);
+        let reverted = false;
+        try { reverted = readIntents().some((intent) => intent.hash === sent && intent.status === "reverted"); }
+        catch { /* Unavailable storage cannot establish a confirmed revert. */ }
         setMintLocked(!reverted);
         try {
           saveMintSource(
@@ -252,7 +268,7 @@ export default function Recovery({
         }
       }
     } finally {
-      setBusy("");
+      if (epoch === current.current.session) setBusy("");
     }
   }
   async function checkReceipt() {
@@ -273,44 +289,10 @@ export default function Recovery({
         method: "eth_accounts",
       });
       if (!accounts[0]) throw Error("Connect the destination owner wallet.");
-      const { rpc, transmitter, message } = await destinationChecks(
-        window.ethereum,
-        destination,
-        record,
-        accounts[0],
-        true,
-      );
-      const receipt = await rpc.waitForTransactionReceipt({
-        hash: mintHash,
-        confirmations: 2,
-        timeout: 15000,
-      });
-      if (
-        receipt.to?.toLowerCase() !== destination.manifest.vault.toLowerCase()
-      )
-        throw Error(
-          "Saved mint receipt does not target the destination vault.",
-        );
-      const transaction = await rpc.getTransaction({ hash: mintHash });
-      const receiveData = encodeFunctionData({
-        abi: MessageTransmitterV2Abi,
-        functionName: "receiveMessage",
-        args: [message, record.attestation],
-      });
-      const expectedCall = encodeFunctionData({
-        abi: vaultAbi,
-        functionName: "ownerExecute",
-        args: [transmitter, 0n, receiveData],
-      });
-      if (transaction.input.toLowerCase() !== expectedCall.toLowerCase())
-        throw Error(
-          "Saved destination transaction does not match this exact attested transfer.",
-        );
-      if (receipt.transactionHash.toLowerCase() !== mintHash.toLowerCase())
-        throw Error(
-          "RPC returned a receipt for a different transaction. Keep the original destination hash.",
-        );
-      if (receipt.status === "reverted") {
+      const original = readIntents().find((intent) => intent.kind === "mint" && intent.hash === mintHash && intent.meta.sourceHash === record.burnTxHash?.toLowerCase() && intent.to === destination.manifest.vault.toLowerCase());
+      if (!original) throw Error("The original public receiving intent is required.");
+      const { intent } = await reconcileIntent(window.ethereum, original.id, mintHash);
+      if (intent.status === "reverted") {
         setMintLocked(false);
         saveMintSource(
           record.burnTxHash!,
@@ -324,17 +306,6 @@ export default function Recovery({
         );
         return;
       }
-      validateReceipt(receipt, mintHash);
-      const used = await rpc.readContract({
-        address: transmitter,
-        abi: MessageTransmitterV2Abi,
-        functionName: "usedNonces",
-        args: [messageNonce(message)],
-      });
-      if (used === 0n)
-        throw Error(
-          "Successful receipt did not consume the CCTP nonce. Do not retry until the discrepancy is resolved.",
-        );
       setMintLocked(true);
       saveMintSource(
         record.burnTxHash!,
@@ -344,7 +315,7 @@ export default function Recovery({
       );
       onRecordsChange();
       setStatus(
-        "Destination receiving confirmed twice; exact call and consumed CCTP nonce verified. No further mint is allowed.",
+        "Destination receiving confirmed twice; exact call, consumed CCTP nonce and vault credit verified. No further mint is allowed.",
       );
     } catch (e) {
       setError(explain(e));
@@ -396,7 +367,7 @@ export default function Recovery({
         <button
           className="primary"
           disabled={
-            !record?.message || !destinationText || mintLocked || !!busy
+            !record?.message || !destinationText || mintLocked || !!busy || journal.blocked
           }
           onClick={review}
         >
@@ -485,7 +456,7 @@ export default function Recovery({
               <button
                 className="primary"
                 onClick={confirm}
-                disabled={!!busy || mintLocked}
+                disabled={!!busy || mintLocked || spent || journal.blocked}
               >
                 Confirm destination mint in wallet ↗
               </button>

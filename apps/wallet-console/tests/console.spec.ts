@@ -63,6 +63,15 @@ test("demo operator cannot prepare owner policy changes", async ({ page }) => {
     page.getByRole("button", { name: "Review policy" }),
   ).toBeDisabled();
 });
+test("demo queued approval remains an explicit read-only review", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Explore demo" }).click();
+  await page.getByRole("button", { name: /^Approvals(?: \d+)?$/ }).click();
+  await page.getByRole("button", { name: "Review approval" }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByRole("dialog").getByText("Demo preview — signing is disabled")).toBeVisible();
+  await expect(page.getByRole("dialog").getByRole("button", { name: "Confirm in wallet" })).toBeDisabled();
+});
 test("mobile navigation and help remain keyboard usable", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
@@ -77,6 +86,51 @@ test("mobile navigation and help remain keyboard usable", async ({ page }) => {
       () => document.documentElement.scrollWidth <= window.innerWidth,
     ),
   ).toBeTruthy();
+});
+test("public intent recovery keeps the full transaction hash within mobile and desktop layouts", async ({ page }) => {
+  const hash = `0x${"cc".repeat(32)}`;
+  await page.addInitScript((intent) => {
+    localStorage.setItem("agentwallet-public-intents-v1", JSON.stringify([intent]));
+  }, {
+    id: "e20e7417-32bd-4c94-a7a4-0adecd420d3b",
+    kind: "vault",
+    status: "unknown",
+    chainId: 84532,
+    from: `0x${"11".repeat(20)}`,
+    to: `0x${"22".repeat(20)}`,
+    value: "0",
+    nonce: "1",
+    dataHash: `0x${"aa".repeat(32)}`,
+    hash,
+    label: "Visual fixture payment recovery",
+    createdAt: "2026-10-13T00:00:00.000Z",
+    meta: { vaultRuntimeHash: `0x${"bb".repeat(32)}`, amount: "0.01 ETH" },
+  });
+  for (const width of [390, 1440]) {
+    await test.step(`${width}px viewport`, async () => {
+      await page.setViewportSize({ width, height: 844 });
+      await page.goto("/");
+      const recovery = page.locator(".intent-recovery");
+      await expect(recovery.getByRole("heading", { name: "Wallet request recovery" })).toBeVisible();
+      await expect(recovery.getByText("Saved receipt unresolved", { exact: true })).toBeVisible();
+      const link = recovery.getByRole("link", { name: `${hash} ↗`, exact: true });
+      await expect(link).toBeVisible();
+      await expect(link).toHaveAttribute("href", `https://sepolia.basescan.org/tx/${hash}`);
+      await expect(recovery.getByLabel("Recovered transaction hash")).toHaveValue(hash);
+      const layout = await page.evaluate(() => ({
+        width: window.innerWidth,
+        scrollWidth: document.documentElement.scrollWidth,
+        overflow: Array.from(document.querySelectorAll(".intent-recovery *")).flatMap((element) => {
+          const rect = element.getBoundingClientRect();
+          return rect.right > window.innerWidth ? [{ tag: element.tagName, class: element.className, right: rect.right }] : [];
+        }),
+      }));
+      expect(layout.scrollWidth, JSON.stringify(layout)).toBeLessThanOrEqual(layout.width);
+      const hashRects = await link.evaluate((element) => Array.from(element.getClientRects(), (rect) => ({ left: rect.left, right: rect.right })));
+      expect(hashRects.length).toBeGreaterThan(0);
+      expect(hashRects.every((rect) => rect.left >= 0 && rect.right <= width)).toBeTruthy();
+    });
+  }
 });
 test("deployment setup is explicit, testnet-only and never signs while disconnected", async ({
   page,

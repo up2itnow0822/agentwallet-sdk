@@ -1,6 +1,7 @@
 export {
   X402Client,
   X402PaymentError,
+  X402SubmittedPaymentError,
   X402BudgetExceededError,
   PAYMENT_BINDING_TYPES,
 } from "./client.js";
@@ -24,14 +25,19 @@ export {
   GUARDED_TRANSACTION_SCHEME,
   PAYMENT_REQUIRED_HEADER,
   PAYMENT_HEADER,
+  PAYMENT_RECEIPT_HEADER,
 } from "./types.js";
 export type {
   X402ClientConfig,
   ApprovedPaymentService,
   GuardedPaymentRequirements,
   GuardedPaymentRequired,
+  X402PaymentReceipt,
+  X402PaymentRecovery,
   FetchFunction,
 } from "./types.js";
+export { getX402PaymentReceipt } from "./receipt.js";
+export { getX402PaymentRecovery, retryX402PaymentProof } from "./recovery.js";
 export {
   AbstractDelegatedFacilitatorAdapter,
   ABSTRACT_CHAIN_IDS,

@@ -94,6 +94,8 @@ function validate(value: unknown): asserts value is MerchantLedger {
         "resource",
         "requestId",
         "expiresAt",
+        "confirmations",
+        "proofExpiresAt",
       ]) ||
       p.scheme !== GUARDED_TRANSACTION_SCHEME ||
       typeof p.network !== "string" ||
@@ -110,7 +112,13 @@ function validate(value: unknown): asserts value is MerchantLedger {
       p.resource.length > 2048 ||
       !Number.isSafeInteger(p.expiresAt) ||
       Number(p.expiresAt) <= Number(challenge.issuedAt) ||
-      Number(p.expiresAt) > Number(challenge.issuedAt) + 300000
+      Number(p.expiresAt) > Number(challenge.issuedAt) + 300000 ||
+      !Number.isSafeInteger(p.confirmations) ||
+      Number(p.confirmations) < 1 ||
+      Number(p.confirmations) > 64 ||
+      !Number.isSafeInteger(p.proofExpiresAt) ||
+      Number(p.proofExpiresAt) < Number(p.expiresAt) + 30000 * Number(p.confirmations) ||
+      Number(p.proofExpiresAt) > Number(p.expiresAt) + 86400000
     )
       throw new Error("Corrupt merchant payment details");
     const resource = new URL(p.resource);
@@ -259,7 +267,7 @@ export class MerchantSettlementStore {
   issue(challenge: IssuedPaymentChallenge): void {
     this.transaction((ledger) => {
       for (const [id, old] of Object.entries(ledger.challenges))
-        if (old.payment.expiresAt <= Date.now()) delete ledger.challenges[id];
+        if (old.payment.proofExpiresAt <= Date.now()) delete ledger.challenges[id];
       if (
         ledger.challenges[challenge.payment.requestId] ||
         ledger.consumedRequests[challenge.payment.requestId] ||
@@ -276,7 +284,7 @@ export class MerchantSettlementStore {
       if (ledger.consumedRequests[id])
         throw new Error("Payment request already consumed");
       const challenge = ledger.challenges[id];
-      if (!challenge || challenge.payment.expiresAt <= Date.now())
+      if (!challenge || challenge.payment.proofExpiresAt <= Date.now())
         throw new Error("Unknown or expired payment challenge");
       return freezeChallenge(challenge);
     });
@@ -291,7 +299,7 @@ export class MerchantSettlementStore {
       if (
         !stored ||
         JSON.stringify(stored) !== JSON.stringify(challenge) ||
-        stored.payment.expiresAt <= Date.now()
+        stored.payment.proofExpiresAt <= Date.now()
       )
         throw new Error("Expired or altered payment challenge");
       if (Object.keys(ledger.consumedRequests).length >= 10000)

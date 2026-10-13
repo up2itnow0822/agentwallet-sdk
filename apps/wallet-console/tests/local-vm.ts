@@ -22,6 +22,18 @@ import {
   type Hex,
 } from "viem";
 import { compileContracts } from "../../../scripts/contracts/compile.mjs";
+export interface RpcPayload {
+  method: string;
+  params?: unknown[];
+}
+export interface WalletTransaction {
+  from: Address;
+  to?: Address;
+  data: Hex;
+  value?: Hex;
+  chainId?: Hex;
+  nonce?: Hex;
+}
 export async function fixture(cctp = false) {
   const compiled = compileContracts(true);
   const extra = JSON.parse(
@@ -298,24 +310,68 @@ export async function fixture(cctp = false) {
           { address: output.address, symbol: "OUTPUT", decimals: 18 },
         ],
   };
+  async function queuedVault(recipient: Address, value: bigint, count: number) {
+    const second = await deploy("contracts/AgentVault.sol", "AgentVault", [
+      accounts[0], accounts[1], router.address, pool.address, messenger.address, 6,
+    ]);
+    await send(accounts[0], second.address, "0x", 10n ** 19n);
+    for (const [functionName, args] of [
+      ["setSpendPolicy", [zeroAddress, 10n ** 18n, 5n * 10n ** 18n, 86400n]],
+      ["setRecipient", [recipient, true]],
+    ] as const) {
+      const configured = await send(accounts[0], second.address, encodeFunctionData({ abi: second.abi, functionName, args }));
+      if (configured.result.execResult.exceptionError) throw Error("Second vault configuration failed");
+    }
+    for (let id = 0; id < count; id++) {
+      const queued = await send(accounts[1], second.address, encodeFunctionData({ abi: second.abi, functionName: "agentExecute", args: [recipient, value, "0x"] }));
+      if (queued.result.execResult.exceptionError) throw Error("Second vault queue failed");
+    }
+    const runtime = bytesToHex(await vm.stateManager.getCode(createAddressFromString(second.address))) as Hex;
+    return { chainId: 84532, vault: second.address, runtimeCodeHash: keccak256(runtime), securityVersion: 1, assets: [] };
+  }
+  async function compatibleVault() {
+    const second = await queuedVault(receiver.address, 2n * 10n ** 18n, 0);
+    for (const token of [input, output]) {
+      const minted = await send(accounts[0], token.address, encodeFunctionData({ abi: token.abi, functionName: "mint", args: [second.vault, 1000n * 10n ** 18n] }));
+      const policy = await send(accounts[0], second.vault, encodeFunctionData({ abi: vault.abi, functionName: "setSpendPolicy", args: [token.address, 100n * 10n ** 18n, 500n * 10n ** 18n, 86400n] }));
+      if (minted.result.execResult.exceptionError || policy.result.execResult.exceptionError) throw Error("Compatible vault asset configuration failed");
+    }
+    for (const [functionName, args] of [
+      ["setSwapPair", [input.address, output.address, 10n ** 18n, timestamp + 3600n]],
+      ["setBridgeDestination", [0, padHex(receiver.address, { size: 32 })]],
+    ] as const) {
+      const configured = await send(accounts[0], second.vault, encodeFunctionData({ abi: vault.abi, functionName, args }));
+      if (configured.result.execResult.exceptionError) throw Error("Compatible vault protocol configuration failed");
+    }
+    return { ...second, assets: [
+      { address: input.address, symbol: "INPUT", decimals: 18 },
+      { address: output.address, symbol: "OUTPUT", decimals: 18 },
+    ] };
+  }
   let active = accounts[0];
   let currentChain = 84532;
   let writes = 0;
   let reject = false;
   let raceRevert = false;
   let receiptError = false;
+  let receiptStatus: string | undefined;
+  let loseSendResponse = false;
+  let lostSendMessage = "RPC response lost after broadcast";
+  let pendingDelay = 0;
+  let pendingReads = { active: 0, max: 0, ids: [] as bigint[], blocks: [] as string[] };
+  const pendingSelector = encodeFunctionData({ abi: vault.abi, functionName: "getPending", args: [0n] }).slice(0, 10);
   const receipts = new Map<string, unknown>();
   const transactions = new Map<string, unknown>();
+  const submittedTransactions: WalletTransaction[] = [];
   async function rawRpc({
     method,
     params = [],
-  }: {
-    method: string;
-    params?: unknown[];
-  }) {
+  }: RpcPayload) {
     if (method === "eth_requestAccounts" || method === "eth_accounts")
       return [active];
     if (method === "eth_chainId") return toHex(currentChain);
+    if (method === "eth_getTransactionCount")
+      return toHex((await vm.stateManager.getAccount(createAddressFromString(params[0] as string)))?.nonce ?? 0n);
     if (method === "eth_blockNumber") {
       blockNumber++;
       return toHex(blockNumber);
@@ -387,13 +443,10 @@ export async function fixture(cctp = false) {
       }
     }
     if (method === "eth_sendTransaction") {
-      if (reject) throw Error("4001 User rejected request");
-      const tx = params[0] as {
-        from: Address;
-        to?: Address;
-        data: Hex;
-        value?: Hex;
-      };
+      if (reject) throw Object.assign(Error("User rejected request"), { code: 4001 });
+      const tx = params[0] as WalletTransaction;
+      submittedTransactions.push({ ...tx });
+      const nonce = (await vm.stateManager.getAccount(createAddressFromString(tx.from)))!.nonce;
       if (raceRevert)
         await send(
           accounts[0],
@@ -441,39 +494,89 @@ export async function fixture(cctp = false) {
         value: tx.value ?? "0x0",
         gas: "0x7a1200",
         gasPrice: "0x1",
-        nonce: "0x0",
+        nonce: toHex(nonce),
+        chainId: tx.chainId ?? toHex(currentChain),
         blockNumber: toHex(blockNumber),
         blockHash: "0x" + "ab".repeat(32),
         transactionIndex: "0x0",
         type: "0x0",
       });
+      if (loseSendResponse) {
+        loseSendResponse = false;
+        throw Error(lostSendMessage);
+      }
       return r.hash;
     }
     if (method === "eth_getTransactionByHash")
       return transactions.get(params[0] as string) ?? null;
     if (method === "eth_getTransactionReceipt" && receiptError)
       throw Error("network unavailable after submission");
-    if (method === "eth_getTransactionReceipt")
-      return receipts.get(params[0] as string) ?? null;
+    if (method === "eth_getTransactionReceipt") {
+      const receipt = receipts.get(params[0] as string);
+      return receipt && receiptStatus !== undefined ? { ...receipt as object, status: receiptStatus } : receipt ?? null;
+    }
     throw Error("Unsupported fixture RPC " + method);
   }
   let rpcTail: Promise<unknown> = Promise.resolve();
-  function rpc(payload: { method: string; params?: unknown[] }) {
+  const deferred: {
+    method: string;
+    reached: () => void;
+    released: Promise<void>;
+  }[] = [];
+  function deferNext(method: string) {
+    let reached!: () => void;
+    let release!: () => void;
+    const requested = new Promise<void>((resolve) => (reached = resolve));
+    const released = new Promise<void>((resolve) => (release = resolve));
+    deferred.push({ method, reached, released });
+    return { requested, release };
+  }
+  function rpc(payload: RpcPayload) {
+    const call = payload.params?.[0] as { data?: Hex } | undefined;
+    const isPendingRead = pendingDelay > 0 && payload.method === "eth_call" && call?.data?.startsWith(pendingSelector);
+    if (isPendingRead) {
+      pendingReads.active++;
+      pendingReads.max = Math.max(pendingReads.max, pendingReads.active);
+      pendingReads.ids.push(BigInt("0x" + call!.data!.slice(10)));
+      pendingReads.blocks.push(String(payload.params?.[1]));
+    }
+    const gateIndex = deferred.findIndex((g) => g.method === payload.method);
+    const gate = gateIndex < 0 ? undefined : deferred.splice(gateIndex, 1)[0];
     const next = rpcTail.then(() => rawRpc(payload));
     rpcTail = next.then(
       () => {},
       () => {},
     );
-    return next;
+    // Hold an already-computed response so tests can deliver a wallet event
+    // before stale reads/signing responses reach the browser. VM work stays serial.
+    const response = gate
+      ? next.then(async (result) => {
+          gate.reached();
+          await gate.released;
+          return result;
+        })
+      : next;
+    return isPendingRead
+      ? response.then(async (result) => {
+          await new Promise((resolve) => setTimeout(resolve, pendingDelay));
+          return result;
+        }).finally(() => pendingReads.active--)
+      : response;
   }
   return {
     manifest,
     destinationManifest,
+    queuedVault,
+    compatibleVault,
     input: input.address,
     output: output.address,
     receiver: receiver.address,
     accounts,
     rpc,
+    deferNext,
+    submittedTransactions,
+    get lastHash() { return [...transactions.keys()].at(-1) as Hex | undefined; },
+    get pendingReadStats() { return pendingReads; },
     get writes() {
       return writes;
     },
@@ -513,6 +616,15 @@ export async function fixture(cctp = false) {
     setChain: (n: number) => (currentChain = n),
     setReject: (value: boolean) => (reject = value),
     setReceiptError: (v: boolean) => (receiptError = v),
+    setReceiptStatus: (value?: string) => (receiptStatus = value),
     setRaceRevert: (v: boolean) => (raceRevert = v),
+    loseNextSendResponse: (message = "RPC response lost after broadcast") => {
+      loseSendResponse = true;
+      lostSendMessage = message;
+    },
+    delayPendingReads: (ms: number) => {
+      pendingDelay = ms;
+      pendingReads = { active: 0, max: 0, ids: [], blocks: [] };
+    },
   };
 }

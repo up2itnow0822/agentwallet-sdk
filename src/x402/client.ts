@@ -4,10 +4,18 @@ import {
   isAddress,
   zeroAddress,
   type Address,
+  type Hash,
+  type TransactionReceipt,
 } from "viem";
 import type { AgentWallet } from "../types.js";
-import { executeVaultOperation } from "../wallet/execution.js";
+import {
+  executeVaultOperation,
+  SubmittedTransactionError,
+  verifyGuardedWallet,
+} from "../wallet/execution.js";
 import { fetchPublicPaymentResource } from "./transport.js";
+import { withX402PaymentReceipt } from "./receipt.js";
+import { rememberX402PaymentRecovery } from "./recovery.js";
 import {
   X402BudgetTracker,
   assertPositiveAmount,
@@ -36,6 +44,9 @@ export const PAYMENT_BINDING_TYPES = Object.freeze({
       { name: "asset", type: "address" },
       { name: "payTo", type: "address" },
       { name: "amount", type: "uint256" },
+      { name: "confirmations", type: "uint256" },
+      { name: "expiresAt", type: "uint256" },
+      { name: "proofExpiresAt", type: "uint256" },
     ].map((field) => Object.freeze(field)),
   ),
 });
@@ -47,6 +58,17 @@ function safeOrigin(value: string): string {
 }
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+interface PaymentRecoveryState {
+  readonly payment: GuardedPaymentRequirements;
+  readonly reservation: string;
+  readonly input: string | Request;
+  readonly init: RequestInit;
+  txHash?: Hash;
+  paymentProof?: string;
+  log?: PaymentLog;
+  observerNotified: boolean;
+  retrying: boolean;
 }
 /** HTTP 402 guarded transaction settlement, explicitly separate from standard x402 exact authorization. */
 export class X402Client {
@@ -62,6 +84,8 @@ export class X402Client {
       wallet.chain.id <= 0
     )
       throw new Error("Invalid guarded wallet");
+    if (config.autoPay === true && (!Number.isSafeInteger(wallet.confirmations) || wallet.confirmations < 1 || wallet.confirmations > 64))
+      throw new Error("Invalid guarded wallet confirmation count");
     this.wallet = Object.freeze({
       ...wallet,
       chain: Object.freeze({ ...wallet.chain }),
@@ -170,6 +194,14 @@ export class X402Client {
       );
     }
     let submitting = false;
+    const state: PaymentRecoveryState = {
+      payment: selected,
+      reservation,
+      input: input instanceof Request ? input.clone() : resource,
+      init: { ...init, method, headers: originalHeaders, redirect: "error" },
+      observerNotified: false,
+      retrying: false,
+    };
     try {
       if (
         this.config.onBeforePayment &&
@@ -189,108 +221,249 @@ export class X402Client {
         this.wallet,
         "agentTransferToken",
         [selected.asset, selected.payTo, amount],
-        { onSubmitted: (txHash) => budget.markSubmitted(reservation, txHash) },
+        {
+          onSubmitted: (txHash) => {
+            state.txHash = txHash;
+            budget.markSubmitted(reservation, txHash);
+          },
+        },
       );
-      if (result.receipt.status !== "success")
-        throw new X402PaymentError("Payment receipt failed", selected);
-      const transferred =
-        result.receipt.transactionHash === result.txHash &&
-        result.receipt.logs.some((log) => {
-          if (log.address.toLowerCase() !== selected.asset.toLowerCase())
-            return false;
-          try {
-            const event = decodeEventLog({
-              abi: TRANSFER_ABI,
-              data: log.data,
-              topics: log.topics,
-              strict: true,
-            });
-            return (
-              event.args.from.toLowerCase() ===
-                this.wallet.address.toLowerCase() &&
-              event.args.to.toLowerCase() === selected.payTo.toLowerCase() &&
-              event.args.value === amount
-            );
-          } catch {
-            return false;
-          }
-        });
-      if (!transferred)
-        throw new X402PaymentError(
-          "No confirmed ERC20 transfer from vault to authorized recipient",
-          selected,
-        );
-      const log: PaymentLog = Object.freeze({
-        timestamp: Math.floor(Date.now() / 1000),
-        service,
-        url: resource,
-        amount,
-        token: selected.asset,
-        recipient: selected.payTo,
-        txHash: result.txHash,
-        requestId: selected.requestId,
-        network: selected.network,
-        scheme: GUARDED_TRANSACTION_SCHEME,
-        success: true,
-      });
+      state.txHash = result.txHash;
+      await this.confirmPayment(state, result.receipt);
+      const log = this.paymentLog(state);
       budget.complete(reservation, log);
-      const account = this.wallet.walletClient.account;
-      if (!account)
-        throw new X402PaymentError(
-          "Missing gas operator account for resource binding",
-          selected,
-        );
-      const signature = await this.wallet.walletClient.signTypedData({
-        account,
-        domain: {
-          name: "AgentVaultTransactionPayment",
-          version: "1",
-          chainId: this.wallet.chain.id,
-          verifyingContract: this.wallet.address,
-        },
-        types: PAYMENT_BINDING_TYPES,
-        primaryType: "PaymentBinding",
-        message: {
-          txHash: result.txHash,
-          resource,
-          requestId: selected.requestId,
-          asset: selected.asset,
-          payTo: selected.payTo,
-          amount,
-        },
-      });
-      const payload = {
-        protocol: GUARDED_TRANSACTION_SCHEME,
-        resource,
-        accepted: selected,
-        payload: {
-          txHash: result.txHash,
-          vault: this.wallet.address,
-          signer: account.address,
-          signature,
-        },
-      };
-      const retryHeaders = new Headers(originalHeaders);
-      retryHeaders.set(
-        PAYMENT_HEADER,
-        Buffer.from(JSON.stringify(payload), "utf8").toString("base64"),
-      );
-      const retry = await this.fetchFn(
-        input instanceof Request ? input.clone() : input,
-        { ...init, headers: retryHeaders, redirect: "error" },
-      );
-      this.validateResponse(retry, resource);
-      // Callback failures must never trigger another payment or change settled accounting.
-      try {
-        this.config.onPaymentComplete?.(log);
-      } catch {
-        /* observer only */
-      }
-      return retry;
+      state.log = log;
+      return await this.deliverPaymentProof(state);
     } catch (error) {
-      if (!submitting) budget.release(reservation);
+      if (!submitting) {
+        budget.release(reservation);
+        throw error;
+      }
       // Once execution begins, even a transport/simulation failure is conservatively retained.
-      throw error;
+      throw this.retainPaymentFailure(error, state);
+    }
+  }
+  private proofTimeRemaining(payment: GuardedPaymentRequirements): number {
+    const remaining = payment.proofExpiresAt - Date.now();
+    if (remaining <= 0)
+      throw new X402PaymentError("Original payment proof deadline expired; contact the merchant with the transaction hash", payment);
+    return remaining;
+  }
+  private async confirmPayment(
+    state: PaymentRecoveryState,
+    priorReceipt?: TransactionReceipt,
+  ): Promise<void> {
+    const txHash = state.txHash!;
+    const selected = state.payment;
+    const depth = Math.max(this.wallet.confirmations, selected.confirmations);
+    const timeout = this.proofTimeRemaining(selected);
+    const receipt = priorReceipt && this.wallet.confirmations >= depth
+      ? priorReceipt
+      : await this.wallet.publicClient.waitForTransactionReceipt({ hash: txHash, confirmations: depth, timeout });
+    if (receipt.status !== "success")
+      throw new X402PaymentError("Payment receipt failed", selected);
+    const transferred =
+      receipt.transactionHash.toLowerCase() === txHash.toLowerCase() &&
+      receipt.logs.some((log) => {
+        if (log.address.toLowerCase() !== selected.asset.toLowerCase())
+          return false;
+        try {
+          const event = decodeEventLog({
+            abi: TRANSFER_ABI,
+            data: log.data,
+            topics: log.topics,
+            strict: true,
+          });
+          return (
+            event.args.from.toLowerCase() ===
+              this.wallet.address.toLowerCase() &&
+            event.args.to.toLowerCase() === selected.payTo.toLowerCase() &&
+            event.args.value === BigInt(selected.amount)
+          );
+        } catch {
+          return false;
+        }
+      });
+    if (!transferred)
+      throw new X402PaymentError(
+        "No confirmed ERC20 transfer from vault to authorized recipient",
+        selected,
+      );
+    this.proofTimeRemaining(selected);
+  }
+  private paymentLog(state: PaymentRecoveryState): PaymentLog {
+    const selected = state.payment;
+    return Object.freeze({
+      timestamp: Math.floor(Date.now() / 1000),
+      service: safeOrigin(selected.resource),
+      url: selected.resource,
+      amount: BigInt(selected.amount),
+      token: selected.asset,
+      recipient: selected.payTo,
+      txHash: state.txHash!,
+      requestId: selected.requestId,
+      network: selected.network,
+      scheme: GUARDED_TRANSACTION_SCHEME,
+      success: true,
+    });
+  }
+  private async createPaymentProof(state: PaymentRecoveryState): Promise<string> {
+    const selected = state.payment;
+    const account = this.wallet.walletClient.account;
+    if (!account)
+      throw new X402PaymentError(
+        "Missing gas operator account for resource binding",
+        selected,
+      );
+    const signature = await this.wallet.walletClient.signTypedData({
+      account,
+      domain: {
+        name: "AgentVaultTransactionPayment",
+        version: "1",
+        chainId: this.wallet.chain.id,
+        verifyingContract: this.wallet.address,
+      },
+      types: PAYMENT_BINDING_TYPES,
+      primaryType: "PaymentBinding",
+      message: {
+        txHash: state.txHash!,
+        resource: selected.resource,
+        requestId: selected.requestId,
+        asset: selected.asset,
+        payTo: selected.payTo,
+        amount: BigInt(selected.amount),
+        confirmations: BigInt(selected.confirmations),
+        expiresAt: BigInt(selected.expiresAt),
+        proofExpiresAt: BigInt(selected.proofExpiresAt),
+      },
+    });
+    const payload = {
+      protocol: GUARDED_TRANSACTION_SCHEME,
+      resource: selected.resource,
+      accepted: selected,
+      payload: {
+        txHash: state.txHash!,
+        vault: this.wallet.address,
+        signer: account.address,
+        signature,
+      },
+    };
+    return Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
+  }
+  private async deliverPaymentProof(state: PaymentRecoveryState, init?: RequestInit): Promise<Response> {
+    const selected = state.payment;
+    this.proofTimeRemaining(selected);
+    const method = (init?.method ?? state.init.method ?? "GET").toUpperCase();
+    if (!["GET", "HEAD"].includes(method))
+      throw new X402PaymentError("Guarded payment proof retries support GET/HEAD only", selected);
+    const retryHeaders = new Headers(init?.headers ?? state.init.headers);
+    if (retryHeaders.has(PAYMENT_HEADER) || retryHeaders.has("PAYMENT-SIGNATURE") || retryHeaders.has("X-PAYMENT"))
+      throw new X402PaymentError("Caller-supplied payment proof is not allowed", selected);
+    state.paymentProof ??= await this.createPaymentProof(state);
+    this.proofTimeRemaining(selected);
+    retryHeaders.set(
+      PAYMENT_HEADER,
+      state.paymentProof,
+    );
+    const retry = await this.fetchFn(
+      state.input instanceof Request ? state.input.clone() : state.input,
+      { ...state.init, ...init, method, headers: retryHeaders, redirect: "error" },
+    );
+    this.validateResponse(retry, selected.resource);
+    const settledResponse = withX402PaymentReceipt(retry, {
+      protocol: GUARDED_TRANSACTION_SCHEME,
+      settlement: "client-confirmed",
+      txHash: state.txHash!,
+      vault: this.wallet.address,
+      resource: selected.resource,
+      requestId: selected.requestId,
+      network: selected.network,
+      asset: selected.asset,
+      payTo: selected.payTo,
+      amount: selected.amount,
+      confirmations: selected.confirmations,
+      proofExpiresAt: selected.proofExpiresAt,
+    });
+    this.retainPaymentRecovery(settledResponse, state);
+    // Callback failures must never trigger another payment or change settled accounting.
+    try {
+      if (!state.observerNotified) {
+        state.observerNotified = true;
+        this.config.onPaymentComplete?.(state.log!);
+      }
+    } catch {
+      /* observer only */
+    }
+    return settledResponse;
+  }
+  private retainPaymentRecovery(outcome: Response | Error, state: PaymentRecoveryState): void {
+    const txHash = state.txHash;
+    if (!txHash) return;
+    rememberX402PaymentRecovery(outcome, {
+      read: () => Object.freeze({
+        txHash,
+        paymentRequirements: state.payment,
+        ...(state.paymentProof ? { paymentProof: state.paymentProof } : {}),
+      }),
+      retry: (init) => this.retryPaymentProof(state, init),
+    });
+  }
+  private retainPaymentFailure(error: unknown, state: PaymentRecoveryState): unknown {
+    if (error instanceof SubmittedTransactionError) {
+      state.txHash ??= error.txHash;
+      this.retainPaymentRecovery(error, state);
+      return error;
+    }
+    if (state.txHash) {
+      const failure = new X402SubmittedPaymentError(
+        error instanceof Error
+          ? error.message
+          : "Payment settlement or resource delivery failed",
+        state.txHash,
+        state.payment,
+        { cause: error },
+      );
+      this.retainPaymentRecovery(failure, state);
+      return failure;
+    }
+    return error;
+  }
+  private async retryPaymentProof(state: PaymentRecoveryState, init?: RequestInit): Promise<Response> {
+    if (state.retrying)
+      throw this.retainPaymentFailure(new Error("Payment proof retry is already in progress"), state);
+    state.retrying = true;
+    try {
+      this.proofTimeRemaining(state.payment);
+      await verifyGuardedWallet(this.wallet);
+      await this.confirmPayment(state);
+      if (!state.log) {
+        const budget = this.budget!;
+        const pending = budget.getReservations().find((item) => item.id === state.reservation);
+        if (pending) {
+          if (pending.state !== "submitting" || pending.service !== safeOrigin(state.payment.resource) || pending.amount !== BigInt(state.payment.amount) ||
+            pending.binding?.requestId !== state.payment.requestId || pending.binding.resource !== state.payment.resource ||
+            pending.binding.expiresAt !== state.payment.expiresAt || pending.binding.payTo?.toLowerCase() !== state.payment.payTo.toLowerCase() ||
+            pending.binding.confirmations !== state.payment.confirmations || pending.binding.proofExpiresAt !== state.payment.proofExpiresAt ||
+            (pending.txHash && pending.txHash.toLowerCase() !== state.txHash!.toLowerCase()))
+            throw new Error("Original submitted payment reservation does not match; independent recovery required");
+          if (!pending.txHash) budget.markSubmitted(state.reservation, state.txHash!);
+          const log = this.paymentLog(state);
+          budget.complete(state.reservation, log);
+          state.log = log;
+        } else {
+          const completed = budget.getTransactionLog().find((log) => log.txHash.toLowerCase() === state.txHash!.toLowerCase() &&
+            log.requestId === state.payment.requestId && log.url === state.payment.resource &&
+            log.amount === BigInt(state.payment.amount) && log.token.toLowerCase() === state.payment.asset.toLowerCase() &&
+            log.recipient.toLowerCase() === state.payment.payTo.toLowerCase() && log.network === state.payment.network);
+          if (!completed) throw new Error("Original payment accounting is unavailable; independent recovery required");
+          state.log = completed;
+        }
+      }
+      return await this.deliverPaymentProof(state, init);
+    } catch (error) {
+      throw this.retainPaymentFailure(error, state);
+    } finally {
+      state.retrying = false;
     }
   }
   parse402Response(response: Response): GuardedPaymentRequired {
@@ -340,7 +513,15 @@ export class X402Client {
           typeof req.expiresAt !== "number" ||
           !Number.isSafeInteger(req.expiresAt) ||
           req.expiresAt <= Date.now() ||
-          req.expiresAt > Date.now() + 300000
+          req.expiresAt > Date.now() + 300000 ||
+          typeof req.confirmations !== "number" ||
+          !Number.isSafeInteger(req.confirmations) ||
+          req.confirmations < 1 ||
+          req.confirmations > 64 ||
+          typeof req.proofExpiresAt !== "number" ||
+          !Number.isSafeInteger(req.proofExpiresAt) ||
+          req.proofExpiresAt < req.expiresAt + 30000 * Math.max(this.wallet.confirmations, req.confirmations) ||
+          req.proofExpiresAt > req.expiresAt + 86400000
         )
           throw new X402PaymentError("Invalid payment option");
         assertPositiveAmount(BigInt(req.amount));
@@ -352,7 +533,9 @@ export class X402Client {
           amount: req.amount,
           resource: req.resource,
           requestId: req.requestId,
+          confirmations: req.confirmations,
           expiresAt: req.expiresAt,
+          proofExpiresAt: req.proofExpiresAt,
         });
       },
     );
@@ -417,6 +600,26 @@ export class X402PaymentError extends Error {
   ) {
     super(`Guarded payment error: ${message}`);
     this.name = "X402PaymentError";
+  }
+}
+/** A known payment submission requires reconciliation before any new payment, even if delivery failed. */
+export class X402SubmittedPaymentError extends SubmittedTransactionError {
+  readonly resource: string;
+  readonly requestId: string;
+  constructor(
+    message: string,
+    txHash: Hash,
+    readonly paymentRequirements: GuardedPaymentRequirements,
+    options?: ErrorOptions,
+  ) {
+    super(
+      `Guarded payment request failed after transaction ${txHash} was submitted: ${message}; reconcile before paying again`,
+      txHash,
+      options,
+    );
+    this.name = "X402SubmittedPaymentError";
+    this.resource = paymentRequirements.resource;
+    this.requestId = paymentRequirements.requestId;
   }
 }
 export class X402BudgetExceededError extends Error {

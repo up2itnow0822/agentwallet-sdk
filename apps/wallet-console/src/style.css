@@ -864,21 +864,28 @@ pre {
 .empty p {
   font-size: 11px;
 }
-.pending {
+.pending,
+.intent-entry {
   border-top: 1px solid var(--border);
   padding: 20px 0;
 }
-.pending dl {
+.pending dl,
+.intent-entry dl {
   display: grid;
   grid-template-columns: 150px minmax(0, 1fr);
   gap: 12px;
   font-size: 11px;
 }
-.pending dt {
+.pending dt,
+.intent-entry dt {
   color: var(--muted);
 }
-.pending dd {
+.pending dd,
+.intent-entry dd {
   margin: 0;
+  overflow-wrap: anywhere;
+}
+.intent-entry > a {
   overflow-wrap: anywhere;
 }
 .button-row {
@@ -1364,11 +1371,13 @@ footer {
   .context-panel h2 {
     font-size: 22px;
   }
-  .pending dl {
+  .pending dl,
+  .intent-entry dl {
     grid-template-columns: 1fr;
     gap: 7px;
   }
-  .pending dd {
+  .pending dd,
+  .intent-entry dd {
     margin-bottom: 8px;
     font-size: 10px;
   }

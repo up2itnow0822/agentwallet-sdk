@@ -12,11 +12,11 @@ Regression tests belong in src/__tests__ with distinct domain prefixes. Test neg
 ## Child DOX Index
 - wallet/AGENTS.md: pinned guarded execution and owner operations.
 - contracts/AGENTS.md: deterministic browser-safe vault ABI and bytecode exports.
-- x402/AGENTS.md: custom guarded HTTP payment settlement and durable service budgets.
+- x402/AGENTS.md: custom guarded HTTP settlement, durable service budgets, signed mining/proof windows and in-session proof-only recovery.
 - policy/AGENTS.md: strict immutable spending decisions/drafts.
 - identity/AGENTS.md: signed credential envelopes, registry and public-address pinned resources.
 - verify/AGENTS.md: independently observed chain/owner-bound trust evidence.
 - staking/AGENTS.md: confirmed AAVE vault positions.
 - swap/AGENTS.md: guarded Router02 quotes and trades.
-- bridge/AGENTS.md: resumable CCTP burns, attestations and minting.
+- bridge/AGENTS.md: resumable CCTP burns, attestations and hash/nonce-bound mint reconciliation.
 - plugins/AGENTS.md: isolated runtime capability facade.

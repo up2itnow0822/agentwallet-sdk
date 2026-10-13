@@ -6,7 +6,22 @@ Current status: **testnet release candidate; public mainnet release blocked**. T
 
 The authoritative command is npm run verify on Node 24 after frozen SDK and console installs. It must pass strict TypeScript, source-only regressions, actual local-EVM adversarial contract tests, clean deterministic SDK/contract build, actual packed-consumer runtime and declaration imports, source secret scan, console build/unit/browser flows and full/production dependency audits. The source secret scan is not a history-wide secret audit.
 
-Final verification and independent fresh-context reviewer results are pending integration. Do not infer readiness from this placeholder or from an owner-supplied mainnetAuthorized SDK flag. UI mainnet writes are disabled.
+Cycle 5's settled candidate passed the complete command on 2026-10-13:
+
+| Check | Evidence |
+| --- | --- |
+| SDK typing and regressions | Strict TypeScript; 220 cases in 23 unique source test files, including 85 payment and 46 bridge cases |
+| On-chain controls | 12 adversarial cases executing real compiled Solidity on local EthereumJS VM |
+| Reproducible artifact | Clean pinned compiler/SDK build; actual 168-file tarball, 10 runtime/typed entrypoints, constructor-only payment example and every migration TypeScript snippet |
+| Source credential scan | 140 indexed paths; disposable test fixtures excluded, no matched credential values printed |
+| Console | Strict production build, 6 UI unit and all 84 browser cases, including real local-EVM transactions and lost broadcast responses |
+| Dependencies | SDK and console full/production audits: four checks, each zero reported vulnerabilities |
+| Repair review | Fresh in-process bridge, payment and final console reviews: no unresolved actionable findings; R01–R19 traced in remediation.md |
+| Final responsive recovery check | Cycle 6: observed red 390→623 horizontal overflow; measured regression and production-preview visual QA now fit 390px mobile/1440px desktop, preserving complete hash text and link |
+
+GitHub runs the same command with frozen installs and read-only permissions. The only subsequent UI change wraps recovery links and adds the measured responsive regression; its strict build passes. The repaired revision must also pass the published current head's nonempty hosted checks and inspected PR feedback before the bounded evaluation stops. The [evaluation record](ci-evaluation.md) and [PR #9](https://github.com/up2itnow0822/agentwallet-sdk/pull/9) carry hosted evidence. An expired external review-bot trial is not an approval.
+
+The initial frozen candidate had eleven review lenses plus separate finding validation; follow-up repair reviews and observed red/green regressions closed the retained findings. These are in-process code reviews, not an independent contract/application audit. RPC fixtures and local protocol doubles do not prove live protocol settlement. An owner-supplied mainnetAuthorized SDK flag is not release evidence. UI mainnet writes remain disabled.
 
 ## External gates
 

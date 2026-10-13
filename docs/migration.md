@@ -14,7 +14,7 @@ SubmittedTransactionError contains txHash after a known broadcast. Never repeat 
 
 This SDK's legacy class names X402Client/X402BudgetTracker now implement the custom agent-vault-tx-v1 settlement scheme with AGENT-VAULT-PAYMENT-REQUIRED and AGENT-VAULT-PAYMENT headers. It is not interoperable with standard x402 exact/EIP-3009 funded-EOA authorizations. Abstract delegated facilitator support rejects until a compatible audited implementation exists.
 
-Auto-payment defaults off. Supply explicit approved origin/recipient/asset/network tuples, positive bigint limits and a private durable directory. For example, with a previously verified wallet:
+Auto-payment defaults off. Supply explicit approved origin/recipient/asset/network tuples, positive bigint limits and a private durable directory. The host must pre-create paymentsDirectory as a canonical absolute POSIX path, owned by the signing process with mode 0700 and no symlink components. Agent code must not control or replace this directory. For example, with a previously verified wallet and those trusted host inputs:
 
 ```ts
 import { X402Client } from 'agentwallet-sdk/x402';
@@ -28,12 +28,38 @@ const payments = new X402Client(wallet, {
   }],
   globalDailyLimit: 5_000_000n,
   globalPerRequestMax: 1_000_000n,
-  durableDirectory: './runtime-state/payments',
+  serviceBudgets: [{
+    service: 'https://merchant.example',
+    dailyLimit: 5_000_000n,
+    maxPerRequest: 1_000_000n,
+  }],
+  durableDirectory: paymentsDirectory,
 });
 const response = await payments.fetch('https://merchant.example/resource');
 ```
 
 Merchant configuration must pin the vault, chain, deployment block, asset, recipient, amount, resource, confirmation depth and a separate private durable directory. GuardedPaymentMerchant.issueChallenge() issues a future-payment challenge; verifyPayment(header) checks the signed exact vault transfer and consumes both transaction and request once. createGuardedPaymentResource provides a framework-neutral compatible handler; createGuardedPaymentHttpsServer builds an opt-in Node HTTPS server without listening or deploying automatically. This is a fixed-price protected-resource reference, not a general merchant account platform.
+
+Challenges require confirmations (1–64), expiresAt (latest payment mining timestamp) and proofExpiresAt (the later confirmation/proof delivery deadline). The client waits the greater of its wallet depth and the advertised merchant depth for the original transaction. Merchant challengeTtlMs is 1,000–300,000 milliseconds, default 120,000; proofTtlMs defaults to 3,600,000 and must be at least 30,000 milliseconds per requested confirmation, up to 86,400,000. The client independently checks this allowance against its actual wait depth before reserving or paying. These are bounded timing policies, not finality guarantees. All three fields are bound in the stored challenge and signed proof. Older candidate challenges without them are rejected; reconcile existing candidate payment state before migration, and never reset accounting to accept incompatible records.
+
+Payment settlement and resource delivery have separate outcomes. getX402PaymentReceipt(response) returns immutable, locally verified settlement facts even for a paid 402/503 response; copied or server-supplied receipt headers are not evidence. Post-submission errors retain their known txHash; X402SubmittedPaymentError additionally retains the resource, requestId, original requirements and cause. getX402PaymentRecovery(responseOrError) identifies the original challenge/hash and optional retained proof. retryX402PaymentProof(responseOrError) rechecks that transaction and retries only its original proof/resource, without another transfer, another reservation or an extended deadline. For an unsuccessful HTTP response:
+
+```ts
+import {
+  getX402PaymentReceipt,
+  getX402PaymentRecovery,
+  retryX402PaymentProof,
+} from 'agentwallet-sdk/x402';
+
+const settlement = getX402PaymentReceipt(response);
+const recovery = getX402PaymentRecovery(response);
+if (!response.ok && settlement && recovery) {
+  const retried = await retryX402PaymentProof(response);
+  console.log(retried.status, getX402PaymentReceipt(retried)?.txHash);
+}
+```
+
+This retry context exists only in the SDK session and its own response clones; serializing an error or reconstructing a Response does not preserve it. Restarted clients retain charged budget state and require independent reconciliation. A consumed proof or a merchant that cannot deliver may still return an error; retain the hash and contact the merchant. Confirmations cannot force resource delivery.
 
 Default transport permits bounded public-address HTTPS GET/HEAD on port 443, pins DNS to validated public addresses and rejects redirects. A caller-supplied fetchFn is a trusted host transport and must preserve equivalent origin, redirect, size and network restrictions. Pending/unknown submissions remain charged across restarts and day changes. Filesystem state and lock files must not be cleared automatically. In-memory accounting is disposable, single-process testing only.
 
@@ -44,6 +70,8 @@ new SwapModule(wallet, {maxSlippageBps:50}) uses the guarded vault. Quotes simul
 new AgentStakingPool({token,aToken}) requires explicit verified deployments. deposit({wallet,amount}) and withdraw({wallet,amount}) submit guarded Aave operations and return hash plus receipt. getBalance(wallet) reads principal and actual aToken balance at one block, including any principal shortfall. No synthetic APY, DID access gate or management fee remains. Owner recovery can alter positions outside tracked principal accounting.
 
 new BridgeModule(wallet,{store:new FileBridgeStore(directory),destinations:{...}}) requires dedicated destination publicClient and gas walletClient. burn(amount,toChain,{destinationAddress}) creates a persistent recoverable burn; bridge additionally waits and mints. Use recoverBurn(id,hash?), waitForAttestation(id), mint(id,attested), resume(id) and recoverMint(id,hash?) to reconcile each state. Source capital always goes through agentBridge; destination receiveMessage only mints a verified attested output and spends gas. Unknown broadcasts block retries, even if a transport did not return a hash. Manual hash recovery verifies the saved intent and transaction calldata.
+
+All burn/mint receipt transitions require the original submitted transaction hash; replacement receipts leave recovery unresolved. Successful destination receipts also require the saved CCTP nonce to be consumed, and resume revalidates previously recorded terminal mints. Submitted-mint receipt reconciliation requires a matching destination RPC, but no new gas funding; only a new burn/mint requires a funded signer. Resetting a mint to retry is limited to its original confirmed reverted receipt.
 
 Only Ethereum/Optimism/Arbitrum/Base and their explicit Sepolia variants are mapped. Mainnet and testnet must match; testnet uses Circle's sandbox. Arbitrary attestation hosts, hooks and undocumented chain names are unsupported. Browser consumers may import the browser-safe maps, ABI and message validator; the Node bridge client and filesystem store cannot be bundled into browsers.
 
