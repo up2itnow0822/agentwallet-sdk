@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+artifacts/
+.cache/
+.env
+.env.*
+!.env.example
+*.log
+*.tgz
+playwright-report/
+test-results/
+runtime-state/
+.worktrees/

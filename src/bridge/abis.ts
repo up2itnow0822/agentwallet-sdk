@@ -1,4 +1,3 @@
-// @ts-nocheck
 // [MAX-ADDED] CCTP V2 Contract ABIs — Circle Cross-Chain Transfer Protocol V2
 // Sources: https://developers.circle.com/stablecoins/cctp-protocol-contract
 /**
@@ -19,7 +18,7 @@ export const TokenMessengerV2Abi = [
             { name: 'maxFee', type: 'uint256' },
             { name: 'minFinalityThreshold', type: 'uint32' },
         ],
-        outputs: [{ name: 'nonce', type: 'uint64' }],
+        outputs: [],
     },
     {
         name: 'depositForBurnWithHook',
@@ -35,7 +34,7 @@ export const TokenMessengerV2Abi = [
             { name: 'minFinalityThreshold', type: 'uint32' },
             { name: 'hookData', type: 'bytes' },
         ],
-        outputs: [{ name: 'nonce', type: 'uint64' }],
+        outputs: [],
     },
     {
         name: 'localMessageTransmitter',
@@ -51,7 +50,7 @@ export const TokenMessengerV2Abi = [
         inputs: [],
         outputs: [{ name: '', type: 'uint32' }],
     },
-];
+] as const;
 /**
  * CCTP V2 MessageTransmitterV2 ABI (destination chain)
  * Key function: receiveMessage — mints USDC using attested message
@@ -81,7 +80,7 @@ export const MessageTransmitterV2Abi = [
         inputs: [],
         outputs: [{ name: '', type: 'uint32' }],
     },
-];
+] as const;
 /**
  * Minimal ERC20 ABI — approve + allowance + balanceOf
  */
@@ -113,7 +112,7 @@ export const ERC20BridgeAbi = [
         inputs: [{ name: 'account', type: 'address' }],
         outputs: [{ name: '', type: 'uint256' }],
     },
-];
+] as const;
 /**
  * MessageTransmitter MessageSent event ABI — emitted during depositForBurn
  * Used to extract the CCTP message bytes and hash for attestation polling.
@@ -126,5 +125,4 @@ export const MessageSentEventAbi = [
             { name: 'message', type: 'bytes', indexed: false },
         ],
     },
-];
-//# sourceMappingURL=abis.js.map
+] as const;

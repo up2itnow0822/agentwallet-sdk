@@ -5,7 +5,7 @@ import { deriveAgentDID, issueCredential, verifyCredential } from '../identity/d
 const TEST_PRIVATE_KEY = '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
 
 describe('verifyTrustBundle', () => {
-  it('verifies a valid trust bundle signature', () => {
+  it('verifies a valid trust bundle signature', async () => {
     // Build a mock bundle that was signed with the same mechanism
     // We'll use the verifyAgent output structure directly via manual construction
     const agentDID = deriveAgentDID(TEST_PRIVATE_KEY);
@@ -24,10 +24,10 @@ describe('verifyTrustBundle', () => {
     };
 
     // Bundle with invalid signature should return false
-    expect(verifyTrustBundle(bundle)).toBe(false);
+    expect(await verifyTrustBundle(bundle as never)).toBe(false);
   });
 
-  it('returns false for tampered bundle data', () => {
+  it('returns false for tampered bundle data', async () => {
     const bundle = {
       did: 'did:key:z6MkFakeNotReal',
       walletAddress: '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266' as `0x${string}`,
@@ -38,7 +38,7 @@ describe('verifyTrustBundle', () => {
       verifiedAt: 1000000,
       signature: 'zFakeSignature',
     };
-    expect(verifyTrustBundle(bundle)).toBe(false);
+    expect(await verifyTrustBundle(bundle as never)).toBe(false);
   });
 });
 

@@ -1,4 +1,3 @@
-// @ts-nocheck
 // [MAX-ADDED] ABIs for Uniswap V3 SwapRouter02 and QuoterV2 on Base Mainnet
 /** Uniswap V3 SwapRouter02 ABI — exactInputSingle */
 export const UniswapV3RouterAbi = [
@@ -41,7 +40,7 @@ export const UniswapV3RouterAbi = [
         ],
         outputs: [{ name: 'amountOut', type: 'uint256' }],
     },
-];
+] as const;
 /** Uniswap V3 QuoterV2 ABI — quoteExactInputSingle */
 export const UniswapV3QuoterV2Abi = [
     {
@@ -68,7 +67,7 @@ export const UniswapV3QuoterV2Abi = [
             { name: 'gasEstimate', type: 'uint256' },
         ],
     },
-];
+] as const;
 /** Minimal ERC-20 ABI for allowance, approve, transferFrom */
 export const ERC20Abi = [
     {
@@ -115,5 +114,4 @@ export const ERC20Abi = [
         inputs: [],
         outputs: [{ name: '', type: 'uint8' }],
     },
-];
-//# sourceMappingURL=abi.js.map
+] as const;

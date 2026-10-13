@@ -1,50 +1,86 @@
 {
   "name": "agentwallet-sdk",
-  "version": "4.0.5",
-  "description": "Non-custodial AI agent wallet SDK. x402 payments, 17-chain CCTP bridging, ERC-6551 identity, SpendingPolicy guardrails, agent DID, staking, trust verification. The agent holds the keys.",
+  "version": "5.0.0-rc.1",
+  "description": "Guarded non-custodial agent vault SDK with explicit owner/operator controls, verified receipts, durable budgets and wallet console.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     },
     "./identity": {
-      "import": "./dist/identity/index.js",
-      "types": "./dist/identity/index.d.ts"
+      "types": "./dist/identity/index.d.ts",
+      "import": "./dist/identity/index.js"
     },
     "./staking": {
-      "import": "./dist/staking/index.js",
-      "types": "./dist/staking/index.d.ts"
+      "types": "./dist/staking/index.d.ts",
+      "import": "./dist/staking/index.js"
     },
     "./verify": {
-      "import": "./dist/verify/index.js",
-      "types": "./dist/verify/index.d.ts"
+      "types": "./dist/verify/index.d.ts",
+      "import": "./dist/verify/index.js"
+    },
+    "./x402": {
+      "types": "./dist/x402/index.d.ts",
+      "import": "./dist/x402/index.js"
+    },
+    "./bridge": {
+      "types": "./dist/bridge/index.d.ts",
+      "import": "./dist/bridge/index.js"
+    },
+    "./swap": {
+      "types": "./dist/swap/index.d.ts",
+      "import": "./dist/swap/index.js"
+    },
+    "./policy": {
+      "types": "./dist/policy/SpendingPolicy.d.ts",
+      "import": "./dist/policy/SpendingPolicy.js"
+    },
+    "./plugins/elizaos": {
+      "types": "./dist/plugins/elizaos.d.ts",
+      "import": "./dist/plugins/elizaos.js"
+    },
+    "./contracts": {
+      "types": "./dist/contracts/index.d.ts",
+      "import": "./dist/contracts/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "contracts/AgentVault.sol",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "docs/migration.md",
+    "src/identity/MIGRATION.md",
+    "docs/security/threat-model.md",
+    "docs/security/remediation.md",
+    "docs/security/release-readiness.md",
+    "docs/security/ci-evaluation.md",
+    "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
-    "clean": "rm -rf dist",
-    "test": "vitest run"
+    "build": "node scripts/clean.mjs && node scripts/contracts/compile.mjs && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:contracts": "node scripts/contracts/test.mjs",
+    "test:package": "node scripts/package-smoke.mjs",
+    "test:secrets": "node scripts/secret-scan.mjs",
+    "audit:all": "npm audit --audit-level=low && npm audit --omit=dev --audit-level=low && npm --prefix apps/wallet-console audit --audit-level=low && npm --prefix apps/wallet-console audit --omit=dev --audit-level=low",
+    "ui:dev": "npm --prefix apps/wallet-console run dev",
+    "ui:build": "npm --prefix apps/wallet-console run build",
+    "verify": "npm run typecheck && npm test && npm run test:contracts && npm run build && npm run test:package && npm run test:secrets && npm run ui:build && npm --prefix apps/wallet-console run test:unit && npm --prefix apps/wallet-console test && npm run audit:all",
+    "clean": "node scripts/clean.mjs"
   },
   "keywords": [
     "agent-wallet",
-    "ai-agent",
-    "crypto",
-    "web3",
-    "did",
-    "verifiable-credentials",
-    "aave",
-    "staking",
-    "x402",
     "non-custodial",
-    "agent-payments",
-    "autonomous-agent"
+    "guarded-vault",
+    "ai-agent",
+    "spending-limits",
+    "crypto",
+    "web3"
   ],
   "license": "MIT",
   "repository": {
@@ -53,14 +89,26 @@
   },
   "author": "up2itnow5280",
   "dependencies": {
-    "@noble/ed25519": "^2.1.0",
-    "@noble/hashes": "^1.4.0",
-    "viem": "2.46.0"
+    "@noble/ed25519": "2.3.0",
+    "@noble/hashes": "1.8.0",
+    "viem": "2.57.4"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
-    "typescript": "5.3.3",
-    "vitest": "4.0.18"
+    "@types/node": "26.6.5",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3",
+    "@openzeppelin/contracts": "5.6.1",
+    "solc": "0.8.37",
+    "@ethereumjs/vm": "10.1.3",
+    "@ethereumjs/common": "10.1.3",
+    "@ethereumjs/tx": "10.1.3",
+    "@ethereumjs/util": "10.1.3",
+    "@ethereumjs/block": "10.1.3"
   },
-  "deprecated": "This package is deprecated. Use the latest agentwallet-sdk from https://github.com/up2itnow0822/agent-wallet-sdk"
+  "engines": {
+    "node": ">=22.20.0"
+  },
+  "overrides": {
+    "tmp": "0.2.7"
+  }
 }
