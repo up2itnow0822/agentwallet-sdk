@@ -1,21 +1,38 @@
-name: CI
+name: Release verification
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'security/**']
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
+  verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - name: Use Node.js
-        uses: actions/setup-node@v7
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          node-version: "20"
-      - name: Install dependencies
-        run: npm install --if-present || true
-      - name: Run tests
-        run: npm test --if-present || echo "No tests configured yet"
+          persist-credentials: false
+      - name: Use Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/wallet-console/package-lock.json
+      - name: Frozen SDK dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Frozen console dependencies
+        run: npm --prefix apps/wallet-console ci --ignore-scripts --no-audit --no-fund
+      - name: Verify source, local EVM, packed SDK, browser flows and audits
+        run: npm run verify

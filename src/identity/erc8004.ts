@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * ERC-8004: Trustless Agents — Identity Registry Integration
  *
@@ -7,10 +6,11 @@
  * with URIStorage extension.
  *
  * Spec: https://eips.ethereum.org/EIPS/eip-8004
- * Status: DRAFT (August 2025). No official mainnet singleton deployed yet.
+ * Draft interface checked 2026-10-12; deployment configuration is always explicit.
  * Key Principle: Non-custodial. All signing happens locally via WalletClient.
  */
-import { createPublicClient, getContract, http, } from 'viem';
+import { createPublicClient, getContract, http, decodeEventLog, isAddress, zeroAddress, type Address, type Hex, type WalletClient, type PublicClient, type Chain } from 'viem';
+import { fetchPublicHttpsJson } from './safe-fetch.js';
 import { base, baseSepolia, mainnet, arbitrum, polygon } from 'viem/chains';
 // ─── ABI ─────────────────────────────────────────────────────────────────────
 export const ERC8004IdentityRegistryAbi = [
@@ -20,7 +20,7 @@ export const ERC8004IdentityRegistryAbi = [
         outputs: [{ name: 'agentId', type: 'uint256' }],
     },
     {
-        name: 'registerWithMetadata', type: 'function', stateMutability: 'nonpayable',
+        name: 'register', type: 'function', stateMutability: 'nonpayable',
         inputs: [
             { name: 'agentURI', type: 'string' },
             { name: 'metadata', type: 'tuple[]', components: [
@@ -31,7 +31,7 @@ export const ERC8004IdentityRegistryAbi = [
         outputs: [{ name: 'agentId', type: 'uint256' }],
     },
     {
-        name: 'registerEmpty', type: 'function', stateMutability: 'nonpayable',
+        name: 'register', type: 'function', stateMutability: 'nonpayable',
         inputs: [], outputs: [{ name: 'agentId', type: 'uint256' }],
     },
     {
@@ -102,7 +102,7 @@ export const ERC8004IdentityRegistryAbi = [
             { name: 'metadataValue', type: 'bytes', indexed: false },
         ],
     },
-];
+] as const;
 // ─── Constants ───────────────────────────────────────────────────────────────
 export const METADATA_KEYS = {
     AGENT_WALLET: 'agentWallet',
@@ -113,22 +113,25 @@ export const METADATA_KEYS = {
     FRAMEWORK: 'agentFramework',
 };
 export const REGISTRATION_FILE_TYPE = 'https://eips.ethereum.org/EIPS/eip-8004#registration-v1';
-export const KNOWN_REGISTRY_ADDRESSES = {
-    'base-sepolia': '0x0000000000000000000000000000000000000000',
-};
+export const KNOWN_REGISTRY_ADDRESSES: Readonly<Partial<Record<keyof typeof CHAINS, Address>>> = Object.freeze({});
 const CHAINS = {
     base, 'base-sepolia': baseSepolia, ethereum: mainnet, arbitrum, polygon,
 };
-const REGISTERED_TOPIC = '0x6f3c9b7e8c3a5a5f2c3f9b7e8c3a5a5f2c3f9b7e8c3a5a5f2c3f9b7e8c3a5a';
+export interface ERC8004Config { chain: keyof typeof CHAINS; registryAddress: Address; rpcUrl: string }
+export interface AgentRegistrationFile { type?: string; name: string; description: string; image?: string; services?: {name:string;endpoint:string;version?:string}[]; registrations?: {agentId:number;agentRegistry:string}[]; [key:string]: unknown }
+export interface ModelMetadata { model?: string; provider?: string; version?: string; framework?: string; capabilities?: string[] }
 // ─── Client ──────────────────────────────────────────────────────────────────
 export class ERC8004Client {
-    constructor(config) {
-        this.config = config;
+    readonly chain: Chain;
+    readonly publicClient: PublicClient;
+    constructor(readonly config: ERC8004Config) {
+        if (!isAddress(config.registryAddress) || config.registryAddress.toLowerCase() === zeroAddress) throw new Error('Provide an explicit nonzero ERC-8004 registry deployment');
+        if (!config.rpcUrl) throw new Error('Provide a trusted RPC URL');
         const chain = CHAINS[config.chain];
         if (!chain)
             throw new Error(`ERC8004Client: Unsupported chain "${config.chain}"`);
         this.chain = chain;
-        this.publicClient = createPublicClient({ chain, transport: http(config.rpcUrl) });
+        this.publicClient = createPublicClient({ chain: chain as Chain, transport: http(config.rpcUrl) }) as PublicClient;
     }
     getReadContract() {
         return getContract({
@@ -137,14 +140,14 @@ export class ERC8004Client {
             client: this.publicClient,
         });
     }
-    getWriteContract(walletClient) {
+    getWriteContract(walletClient: WalletClient) {
         return getContract({
             address: this.config.registryAddress,
             abi: ERC8004IdentityRegistryAbi,
             client: { public: this.publicClient, wallet: walletClient },
         });
     }
-    async registerAgent(walletClient, metadata, agentURI, onChainMetadata) {
+    async registerAgent(walletClient: WalletClient, metadata: AgentRegistrationFile, agentURI?: string, onChainMetadata?: Record<string,string>) {
         if (!walletClient.account)
             throw new Error('ERC8004Client: WalletClient has no account');
         const registrationFile = { type: REGISTRATION_FILE_TYPE, ...metadata };
@@ -153,7 +156,7 @@ export class ERC8004Client {
         let txHash;
         if (onChainMetadata && Object.keys(onChainMetadata).length > 0) {
             const entries = encodeMetadataEntries(onChainMetadata);
-            txHash = await contract.write.registerWithMetadata([resolvedURI, entries], {
+            txHash = await contract.write.register([resolvedURI, entries], {
                 account: walletClient.account, chain: this.chain,
             });
         }
@@ -162,28 +165,27 @@ export class ERC8004Client {
                 account: walletClient.account, chain: this.chain,
             });
         }
-        let agentId = null;
-        try {
-            const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
-            const registeredEvent = receipt.logs.find((log) => log.address.toLowerCase() === this.config.registryAddress.toLowerCase() &&
-                log.topics[0] === REGISTERED_TOPIC);
-            if (registeredEvent?.topics[1]) {
-                agentId = BigInt(registeredEvent.topics[1]);
-            }
+        const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+        if (receipt.status !== 'success') throw new Error('ERC-8004 registration reverted');
+        let agentId: bigint | undefined;
+        for (const log of receipt.logs) {
+            if (log.address.toLowerCase() !== this.config.registryAddress.toLowerCase()) continue;
+            try {
+                const event = decodeEventLog({abi: ERC8004IdentityRegistryAbi, eventName:'Registered', data:log.data, topics:log.topics});
+                if (event.args.owner.toLowerCase() === walletClient.account.address.toLowerCase()) agentId = event.args.agentId;
+            } catch { /* Other registry events */ }
         }
-        catch {
-            // agentId remains null
-        }
-        return { txHash, agentId };
+        if (agentId === undefined) throw new Error('Confirmed registration lacks matching Registered event');
+        return {txHash,agentId,receipt};
     }
-    async lookupAgentIdentity(agentId) {
+    async lookupAgentIdentity(agentId: bigint) {
         const contract = this.getReadContract();
         const [owner, agentURI, agentWallet] = await Promise.all([
             contract.read.ownerOf([agentId]),
             contract.read.tokenURI([agentId]),
             contract.read.getAgentWallet([agentId]),
         ]);
-        let registrationFile = null;
+        let registrationFile: AgentRegistrationFile | null = null;
         try {
             registrationFile = await resolveAgentURI(agentURI);
         }
@@ -194,7 +196,7 @@ export class ERC8004Client {
             agentWallet: agentWallet, registrationFile, modelMetadata,
         };
     }
-    async lookupAgentByOwner(ownerAddress, fromBlock = 0n) {
+    async lookupAgentByOwner(ownerAddress: Address, fromBlock = 0n) {
         const logs = await this.publicClient.getLogs({
             address: this.config.registryAddress,
             event: {
@@ -214,7 +216,7 @@ export class ERC8004Client {
         const agentId = BigInt(latestLog.args?.agentId ?? 0);
         return this.lookupAgentIdentity(agentId);
     }
-    async updateAgentURI(walletClient, agentId, newURI) {
+    async updateAgentURI(walletClient: WalletClient, agentId: bigint, newURI: string) {
         if (!walletClient.account)
             throw new Error('ERC8004Client: WalletClient has no account');
         const contract = this.getWriteContract(walletClient);
@@ -222,12 +224,12 @@ export class ERC8004Client {
             account: walletClient.account, chain: this.chain,
         });
     }
-    async getOnChainMetadata(agentId, key) {
+    async getOnChainMetadata(agentId: bigint, key: string) {
         const contract = this.getReadContract();
         const value = await contract.read.getMetadata([agentId, key]);
         return value === '0x' || value === null ? null : value;
     }
-    async setOnChainMetadata(walletClient, agentId, key, value) {
+    async setOnChainMetadata(walletClient: WalletClient, agentId: bigint, key: string, value: string) {
         if (!walletClient.account)
             throw new Error('ERC8004Client: WalletClient has no account');
         if (key === METADATA_KEYS.AGENT_WALLET) {
@@ -239,9 +241,9 @@ export class ERC8004Client {
             account: walletClient.account, chain: this.chain,
         });
     }
-    async setModelMetadata(walletClient, agentId, model) {
+    async setModelMetadata(walletClient: WalletClient, agentId: bigint, model: ModelMetadata) {
         const hashes = [];
-        const entries = [];
+        const entries: [string,string][] = [];
         if (model.model)
             entries.push([METADATA_KEYS.MODEL, model.model]);
         if (model.provider)
@@ -258,13 +260,13 @@ export class ERC8004Client {
         }
         return hashes;
     }
-    async readModelMetadata(agentId) {
+    async readModelMetadata(agentId: bigint) {
         const keys = [METADATA_KEYS.MODEL, METADATA_KEYS.MODEL_PROVIDER, METADATA_KEYS.VERSION, METADATA_KEYS.FRAMEWORK, METADATA_KEYS.CAPABILITIES];
         const values = await Promise.all(keys.map((k) => this.getOnChainMetadata(agentId, k)));
         const [modelHex, providerHex, versionHex, frameworkHex, capabilitiesHex] = values;
         if (!modelHex && !providerHex && !versionHex && !frameworkHex && !capabilitiesHex)
             return null;
-        const result = {};
+        const result: ModelMetadata = {};
         if (modelHex)
             result.model = hexToString(modelHex);
         if (providerHex)
@@ -274,20 +276,17 @@ export class ERC8004Client {
         if (frameworkHex)
             result.framework = hexToString(frameworkHex);
         if (capabilitiesHex) {
-            try {
-                result.capabilities = JSON.parse(hexToString(capabilitiesHex));
-            }
-            catch {
-                result.capabilities = [];
-            }
+            const parsed: unknown = JSON.parse(hexToString(capabilitiesHex));
+            if (!Array.isArray(parsed) || parsed.some(value => typeof value !== 'string')) throw new Error('On-chain capabilities must be a JSON string array');
+            result.capabilities = parsed as string[];
         }
         return result;
     }
-    async getAgentWallet(agentId) {
+    async getAgentWallet(agentId: bigint) {
         const contract = this.getReadContract();
         return contract.read.getAgentWallet([agentId]);
     }
-    async setAgentWallet(walletClient, agentId, newWallet, deadline, signature) {
+    async setAgentWallet(walletClient: WalletClient, agentId: bigint, newWallet: Address, deadline: bigint, signature: Hex) {
         if (!walletClient.account)
             throw new Error('ERC8004Client: WalletClient has no account');
         const contract = this.getWriteContract(walletClient);
@@ -295,7 +294,7 @@ export class ERC8004Client {
             account: walletClient.account, chain: this.chain,
         });
     }
-    async unsetAgentWallet(walletClient, agentId) {
+    async unsetAgentWallet(walletClient: WalletClient, agentId: bigint) {
         if (!walletClient.account)
             throw new Error('ERC8004Client: WalletClient has no account');
         const contract = this.getWriteContract(walletClient);
@@ -305,77 +304,65 @@ export class ERC8004Client {
     }
 }
 // ─── Standalone helpers ───────────────────────────────────────────────────────
-export function buildDataURI(registrationFile) {
-    const payload = { ...registrationFile, type: REGISTRATION_FILE_TYPE };
-    const json = JSON.stringify(payload);
-    const b64 = btoa(unescape(encodeURIComponent(json)));
-    return `data:application/json;base64,${b64}`;
+export function buildDataURI(registrationFile: AgentRegistrationFile): string {
+    const json = JSON.stringify({...registrationFile,type:REGISTRATION_FILE_TYPE});
+    if (Buffer.byteLength(json) > 1_048_576) throw new Error('Registration exceeds byte limit');
+    return 'data:application/json;base64,'+Buffer.from(json).toString('base64');
 }
-export function parseDataURI(uri) {
-    if (uri.startsWith('data:application/json;base64,')) {
-        const b64 = uri.replace('data:application/json;base64,', '');
-        const json = decodeURIComponent(escape(atob(b64)));
-        return JSON.parse(json);
-    }
-    if (uri.startsWith('{'))
-        return JSON.parse(uri);
-    throw new Error(`parseDataURI: Cannot parse URI scheme: ${uri.substring(0, 50)}`);
+export function parseDataURI(uri: string): AgentRegistrationFile {
+    const prefix = 'data:application/json;base64,';
+    if (!uri.startsWith(prefix)) throw new Error('Only JSON base64 data URIs supported');
+    const payload = uri.slice(prefix.length);
+    if (payload.length > 1_398_104 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(payload)) throw new Error('Invalid or oversized registration');
+    const decoded = Buffer.from(payload,'base64');
+    if (decoded.length > 1_048_576) throw new Error('Registration exceeds byte limit');
+    return checkedRegistration(JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(decoded)) as unknown);
 }
-export async function resolveAgentURI(uri) {
-    if (uri.startsWith('data:'))
-        return parseDataURI(uri);
-    if (uri.startsWith('https://') || uri.startsWith('http://')) {
-        const response = await fetch(uri);
-        if (!response.ok)
-            throw new Error(`resolveAgentURI: HTTP ${response.status} for ${uri}`);
-        return response.json();
-    }
-    throw new Error(`resolveAgentURI: Unsupported URI scheme: ${uri}`);
+export async function resolveAgentURI(uri: string): Promise<AgentRegistrationFile> {
+    if (uri.startsWith('data:')) return parseDataURI(uri);
+    return checkedRegistration(await fetchPublicHttpsJson(uri));
 }
-export function validateRegistrationFile(file) {
-    const errors = [];
-    if (file.type !== REGISTRATION_FILE_TYPE)
-        errors.push(`type must be "${REGISTRATION_FILE_TYPE}"`);
-    if (!file.name || typeof file.name !== 'string' || file.name.trim() === '')
-        errors.push('name is required');
-    if (!file.description || typeof file.description !== 'string')
-        errors.push('description is required');
-    if (file.services) {
-        file.services.forEach((svc, i) => {
-            if (!svc.name)
-                errors.push(`services[${i}].name is required`);
-            if (!svc.endpoint)
-                errors.push(`services[${i}].endpoint is required`);
-        });
-    }
-    if (file.registrations) {
-        file.registrations.forEach((reg, i) => {
-            if (reg.agentId === undefined)
-                errors.push(`registrations[${i}].agentId is required`);
-            if (!reg.agentRegistry)
-                errors.push(`registrations[${i}].agentRegistry is required`);
-        });
+function checkedRegistration(file: unknown): AgentRegistrationFile {
+    const errors = validateRegistrationFile(file);
+    if (errors.length) throw new Error('Invalid registration: '+errors.join('; '));
+    return file as AgentRegistrationFile;
+}
+export function validateRegistrationFile(file: unknown): string[] {
+    if (!file || typeof file !== 'object' || Array.isArray(file)) return ['registration must be an object'];
+    const value = file as Record<string,unknown>, errors: string[] = [];
+    if (value.type !== REGISTRATION_FILE_TYPE) errors.push('invalid registration type');
+    if (typeof value.name !== 'string' || !value.name.trim()) errors.push('name is required');
+    if (typeof value.description !== 'string') errors.push('description is required');
+    for (const key of ['services','registrations']) {
+        if (value[key] === undefined) continue;
+        const items = value[key];
+        if (!Array.isArray(items)) { errors.push(key+' must be an array'); continue; }
+        for (const item of items) {
+            if (!item || typeof item !== 'object') { errors.push('invalid '+key+' item'); continue; }
+            if (key === 'services' && (typeof item.name !== 'string' || typeof item.endpoint !== 'string')) errors.push('invalid service');
+            if (key === 'registrations' && (!Number.isSafeInteger(item.agentId) || item.agentId < 0 || typeof item.agentRegistry !== 'string')) errors.push('invalid registry');
+        }
     }
     return errors;
 }
-export function formatAgentRegistry(chainId, registryAddress) {
+export function formatAgentRegistry(chainId: number, registryAddress: Address) {
     return `eip155:${chainId}:${registryAddress}`;
 }
 // ─── Internal utilities ───────────────────────────────────────────────────────
-function stringToHex(str) {
+function stringToHex(str: string): Hex {
     const bytes = new TextEncoder().encode(str);
     const hexStr = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
-    return ('0x' + hexStr);
+    return ('0x' + hexStr) as Hex;
 }
-function hexToString(hex) {
+function hexToString(hex: Hex): string {
     const stripped = hex.startsWith('0x') ? hex.slice(2) : hex;
-    const bytes = new Uint8Array(stripped.match(/.{1,2}/g).map((byte) => parseInt(byte, 16)));
+    const bytes = new Uint8Array((stripped.match(/.{1,2}/g) ?? []).map((byte) => parseInt(byte, 16)));
     return new TextDecoder('utf-8').decode(bytes);
 }
-function encodeMetadataEntries(entries) {
+function encodeMetadataEntries(entries: Record<string,string>) {
+    if ('agentWallet' in entries) throw new Error('agentWallet metadata is reserved');
     return Object.entries(entries).map(([key, value]) => ({
         metadataKey: key,
         metadataValue: stringToHex(value),
     }));
 }
-//# sourceMappingURL=erc8004.js.map

@@ -44,7 +44,7 @@ describe('Agent DID (did:key)', () => {
     expect(vc.issuer).toBe(did.did);
     expect(vc.type).toContain('VerifiableCredential');
     expect(vc.credentialSubject.agentType).toBe('autonomous');
-    expect(vc.proof.type).toBe('Ed25519Signature2020');
+    expect(vc.proof.type).toBe('AgentWalletEd25519EnvelopeV1');
 
     const valid = verifyCredential(vc);
     expect(valid).toBe(true);

@@ -2,10 +2,10 @@
  * Agent DID + Verifiable Credentials
  *
  * Derives deterministic did:key identifiers from agent private keys and issues
- * W3C-compliant Verifiable Credentials. Zero external registry — fully self-sovereign.
+ * custom AgentWallet signed credential envelopes. Zero external registry — fully self-sovereign.
  *
  * DID format: did:key:z6Mk... (multibase base58btc-encoded ed25519 public key)
- * VC format: W3C VC Data Model v1.1 with Ed25519Signature2020 proof
+ * Credential format is custom JSON, NOT a W3C Data Integrity cryptosuite.
  */
 
 import * as ed from '@noble/ed25519';
@@ -48,11 +48,13 @@ export interface VerifiableCredential {
   type: string[];
   issuer: string;
   issuanceDate: string;
+  expirationDate: string;
   credentialSubject: Record<string, unknown>;
   proof: CredentialProof;
 }
 
 export interface CredentialProof {
+  controller: string;
   type: string;
   created: string;
   verificationMethod: string;
@@ -107,9 +109,9 @@ function pubkeyToMultibase(pubkey: Uint8Array): string {
 }
 
 function multibaseToPubkey(multibase: string): Uint8Array {
-  if (!multibase.startsWith('z')) throw new Error('Expected base58btc multibase (z prefix)');
+  if (!multibase.startsWith('z') || multibase.length !== 48) throw new Error('Expected 48-character ed25519 base58btc multibase');
   const decoded = base58Decode(multibase.slice(1));
-  // Strip the 2-byte multicodec prefix
+  if (decoded.length !== 34 || decoded[0] !== 0xed || decoded[1] !== 0x01) throw new Error('Invalid ed25519 multicodec');
   return decoded.slice(2);
 }
 
@@ -120,6 +122,7 @@ function multibaseToPubkey(multibase: string): Uint8Array {
  * The ed25519 public key is derived from the private key, then multibase-encoded.
  */
 export function deriveAgentDID(privateKey: Hex): AgentDID {
+  if (!/^(0x)?[0-9a-fA-F]{64}$/.test(privateKey)) throw new Error('Expected a 32-byte hex private key');
   // Strip 0x prefix, get raw bytes
   const privKeyBytes = new Uint8Array(
     Buffer.from(privateKey.startsWith('0x') ? privateKey.slice(2) : privateKey, 'hex')
@@ -161,93 +164,86 @@ export function exportDIDDocument(did: AgentDID): DIDDocument {
 }
 
 /**
- * Issue a W3C Verifiable Credential signed with Ed25519Signature2020.
+ * Issue a custom signed JSON envelope. Not a W3C Ed25519Signature2020 implementation.
  */
 export function issueCredential(
   issuerDID: AgentDID,
   privateKey: Hex,
-  claims: Record<string, unknown>
+  claims: Record<string, unknown>,
+  options: { expiresAt?: Date; now?: Date } = {}
 ): VerifiableCredential {
   const privKeyBytes = new Uint8Array(
     Buffer.from(privateKey.startsWith('0x') ? privateKey.slice(2) : privateKey, 'hex')
   );
 
-  const now = new Date().toISOString();
+  const derived = deriveAgentDID(privateKey);
+  if (derived.did !== issuerDID.did || derived.publicKeyHex !== issuerDID.publicKeyHex || derived.publicKeyMultibase !== issuerDID.publicKeyMultibase) throw new Error('Issuer DID does not match signing key');
+  const date = options.now ?? new Date();
+  const now = date.toISOString();
+  const expirationDate = (options.expiresAt ?? new Date(date.getTime() + 3600000)).toISOString();
+  if (Date.parse(expirationDate) <= date.getTime()) throw new Error('Credential expiration must follow issuance');
   const credId = `urn:uuid:${generateUUID()}`;
 
   const vc: Omit<VerifiableCredential, 'proof'> = {
     '@context': [
       'https://www.w3.org/2018/credentials/v1',
-      'https://w3id.org/security/suites/ed25519-2020/v1',
     ],
     id: credId,
-    type: ['VerifiableCredential', 'AgentCredential'],
+    type: ['VerifiableCredential', 'AgentWalletCustomCredentialV1'],
     issuer: issuerDID.did,
     issuanceDate: now,
+    expirationDate,
     credentialSubject: {
-      id: issuerDID.did,
       ...claims,
+      id: issuerDID.did,
     },
   };
 
-  // Sign the canonical form of the credential body
-  const vcBytes = new TextEncoder().encode(canonicalize(vc));
-  const hash = sha256(vcBytes);
-  const sig = ed.sign(hash, privKeyBytes);
-  const proofValue = 'z' + base58Encode(sig);
-
-  const vmId = `${issuerDID.did}#${issuerDID.publicKeyMultibase}`;
-
-  return {
-    ...vc,
-    proof: {
-      type: 'Ed25519Signature2020',
-      created: now,
-      verificationMethod: vmId,
-      proofPurpose: 'assertionMethod',
-      proofValue,
-    },
+  const proofOptions = {
+    type: 'AgentWalletEd25519EnvelopeV1',
+    controller: issuerDID.did,
+    created: now,
+    verificationMethod: `${issuerDID.did}#${issuerDID.publicKeyMultibase}`,
+    proofPurpose: 'assertionMethod',
   };
+  const hash = sha256(new TextEncoder().encode(canonicalize({ ...vc, proof: proofOptions })));
+  return { ...vc, proof: { ...proofOptions, proofValue: 'z' + base58Encode(ed.sign(hash, privKeyBytes)) } };
 }
 
-/**
- * Verify a Verifiable Credential's Ed25519 signature.
- * Returns true if the signature is valid and matches the issuer's DID.
- */
-export function verifyCredential(vc: VerifiableCredential): boolean {
+/** Signature, proof semantics and time checks only; claims are not independently verified. */
+export function verifyCredentialSignature(
+  vc: VerifiableCredential,
+  options: { expectedIssuer?: string; expectedSubject?: string; now?: Date } = {},
+): boolean {
   try {
-    const { proof, ...vcBody } = vc;
-
-    // Extract public key from the verificationMethod DID
-    // Format: did:key:z6Mk...#z6Mk...
-    const vmParts = proof.verificationMethod.split('#');
-    const didPart = vmParts[0];
-    const keyPart = vmParts[1] ?? didPart.replace('did:key:', '');
-
-    const pubkey = multibaseToPubkey(keyPart);
-
-    // Verify the issuer DID matches
-    const expectedDID = `did:key:${keyPart}`;
-    if (vc.issuer !== expectedDID) return false;
-
-    // Re-compute the canonical hash
-    const vcBytes = new TextEncoder().encode(canonicalize(vcBody));
-    const hash = sha256(vcBytes);
-
-    // Decode the signature
-    const sigBytes = base58Decode(proof.proofValue.slice(1)); // strip 'z' prefix
-
-    return ed.verify(sigBytes, hash, pubkey);
-  } catch {
-    return false;
-  }
+    const { proof, ...body } = vc;
+    const { proofValue, ...proofOptions } = proof;
+    if (proof.type !== 'AgentWalletEd25519EnvelopeV1' || proof.proofPurpose !== 'assertionMethod' || proof.controller !== vc.issuer) return false;
+    if (!vc.issuer.startsWith('did:key:')) return false;
+    const key = vc.issuer.slice(8);
+    if (proof.verificationMethod !== `${vc.issuer}#${key}` || !proofValue.startsWith('z') || proofValue.length > 89) return false;
+    if (options.expectedIssuer && vc.issuer !== options.expectedIssuer) return false;
+    if (vc.credentialSubject.id !== (options.expectedSubject ?? vc.issuer)) return false;
+    if (!vc.type.includes('AgentWalletCustomCredentialV1')) return false;
+    const now = (options.now ?? new Date()).getTime();
+    const issued = Date.parse(vc.issuanceDate), expires = Date.parse(vc.expirationDate);
+    if (![issued,expires,now].every(Number.isFinite) || issued > now || expires <= now || expires <= issued || proof.created !== vc.issuanceDate) return false;
+    const signature = base58Decode(proofValue.slice(1));
+    if (signature.length !== 64) return false;
+    return ed.verify(signature, sha256(new TextEncoder().encode(canonicalize({ ...body, proof: proofOptions }))), multibaseToPubkey(key));
+  } catch { return false; }
 }
+/** @deprecated Use verifyCredentialSignature; this never verifies economic facts. */
+export const verifyCredential = verifyCredentialSignature;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Deterministic JSON serialization for consistent signing */
 function canonicalize(obj: unknown): string {
-  if (typeof obj !== 'object' || obj === null) return JSON.stringify(obj);
+  if (obj === null || typeof obj === 'string' || typeof obj === 'boolean') return JSON.stringify(obj);
+  if (typeof obj === 'number' && Number.isFinite(obj)) return JSON.stringify(obj);
+  if (typeof obj !== 'object') throw new Error('Credential claims must be finite JSON values');
+  if (!Array.isArray(obj) && Object.getPrototypeOf(obj) !== Object.prototype) throw new Error('Credential claims must be plain JSON objects');
   if (Array.isArray(obj)) return '[' + obj.map(canonicalize).join(',') + ']';
   const keys = Object.keys(obj as object).sort();
   return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalize((obj as Record<string, unknown>)[k])).join(',') + '}';

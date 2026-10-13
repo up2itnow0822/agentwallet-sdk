@@ -1,145 +1,130 @@
-// @ts-nocheck
-// SwapModule — Uniswap V3 token swap aggregator with 0.875% protocol fee
-import { encodeFunctionData, } from 'viem';
-import { UniswapV3RouterAbi, UniswapV3QuoterV2Abi, ERC20Abi } from './abi.js';
-import { PROTOCOL_FEE_BPS, DEFAULT_SLIPPAGE_BPS, UNISWAP_V3_BASE, } from './types.js';
-const FEE_TIERS = [100, 500, 3000, 10000];
-/** Calculate protocol fee: floor(amount * feeBps / 100_000) */
-export function calcProtocolFee(amount, feeBps) {
-    return (amount * BigInt(feeBps)) / 100000n;
+import { isAddress, zeroAddress } from "viem";
+import type { Address } from "viem";
+import type { AgentWallet } from "../types.js";
+import { executeVaultOperation } from "../wallet/execution.js";
+import { UniswapV3QuoterV2Abi } from "./abi.js";
+import { DEFAULT_SLIPPAGE_BPS, UNISWAP_V3_DEPLOYMENTS } from "./types.js";
+import type { QuoteOptions, SwapConfig, SwapOptions, SwapQuote, SwapResult } from "./types.js";
+const FEE_TIERS = [100, 500, 3000, 10000] as const;
+const routerView = [{ type: "function", name: "router", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] }] as const;
+function positive(amount: bigint) {
+    if (typeof amount !== "bigint" || amount <= 0n || amount >= 2n ** 256n) {
+        throw new Error("Swap amount must be a nonzero uint256 bigint");
+    }
 }
-/** Apply slippage: floor(amount * (10_000 - slippageBps) / 10_000) */
-export function applySlippage(amount, slippageBps) {
-    return (amount * BigInt(10000 - slippageBps)) / 10000n;
+function slippage(value: number, max = 500) {
+    if (!Number.isInteger(value) || value < 0 || value > max) {
+        throw new Error(`Slippage must be 0..${max} basis points`);
+    }
 }
-/** Encode deadline: block.timestamp + deadlineSecs */
-export function calcDeadline(deadlineSecs) {
+function knownOptions(value: object, keys: readonly string[]) {
+    if (Object.keys(value).some(k => !keys.includes(k))) {
+        throw new Error("Unsupported swap option; fees and EOA execution are removed in v5");
+    }
+}
+export function calcProtocolFee(amount: bigint, feeBps = 0): bigint {
+    positive(amount);
+    if (feeBps !== 0) {
+        throw new Error("SDK protocol fees are disabled; owner policy governs spending");
+    }
+    return 0n;
+}
+export function applySlippage(amount: bigint, slippageBps: number): bigint {
+    positive(amount);
+    slippage(slippageBps);
+    return amount * BigInt(10000 - slippageBps) / 10000n;
+}
+export function calcDeadline(deadlineSecs: number): bigint {
+    if (!Number.isInteger(deadlineSecs) || deadlineSecs < 1 || deadlineSecs > 3600) {
+        throw new Error("Deadline duration must be 1..3600 seconds");
+    }
     return BigInt(Math.floor(Date.now() / 1000) + deadlineSecs);
 }
 export class SwapModule {
-    constructor(publicClient, walletClient, accountAddress, config) {
-        this.publicClient = publicClient;
-        this.walletClient = walletClient;
-        this.accountAddress = accountAddress;
-        this.config = {
-            routerAddress: UNISWAP_V3_BASE.ROUTER,
-            quoterAddress: UNISWAP_V3_BASE.QUOTER_V2,
-            feeBps: PROTOCOL_FEE_BPS,
-            feeWallet: '0xff86829393C6C26A4EC122bE0Cc3E466Ef876AdD' as `0x${string}`,
-            ...config,
-        };
-    }
-    async getQuote(tokenIn, tokenOut, amountIn, options = {}) {
-        const slippageBps = options.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
-        const tiersToTry = options.feeTiers ?? FEE_TIERS;
-        const feeAmount = calcProtocolFee(amountIn, this.config.feeBps);
-        const amountInNet = amountIn - feeAmount;
-        if (amountInNet <= 0n) {
-            throw new Error(`SwapModule: amountIn (${amountIn}) is too small — fee (${feeAmount}) exceeds input`);
+    private readonly wallet: AgentWallet;
+    private readonly maxSlippageBps: number;
+    constructor(wallet: AgentWallet, config: SwapConfig = {}) {
+        if (!wallet?.address || !isAddress(wallet.address) || !wallet.chain || !wallet.publicClient || !wallet.walletClient || !wallet.contract || !wallet.expectedCodeHash) {
+            throw new Error("SwapModule v5 requires a guarded AgentWallet; raw EOA clients are unsupported");
         }
-        let bestQuote = null;
-        for (const fee of tiersToTry) {
+        knownOptions(config, ["maxSlippageBps"]);
+        this.maxSlippageBps = config.maxSlippageBps ?? 500;
+        slippage(this.maxSlippageBps);
+        if (!UNISWAP_V3_DEPLOYMENTS[wallet.chain.id]) {
+            throw new Error("Unsupported swap chain; only Base and Base Sepolia are configured");
+        }
+        this.wallet = wallet;
+    }
+    private validate(tokenIn: Address, tokenOut: Address, amount: bigint, options: QuoteOptions) {
+        positive(amount);
+        for (const token of [tokenIn, tokenOut])
+            if (!isAddress(token) || token.toLowerCase() === zeroAddress) {
+                throw new Error("Swap requires ERC20 token addresses");
+            }
+        if (tokenIn.toLowerCase() === tokenOut.toLowerCase()) {
+            throw new Error("Swap pair must contain different tokens");
+        }
+        slippage(options.slippageBps ?? DEFAULT_SLIPPAGE_BPS, this.maxSlippageBps);
+        const tiers = options.feeTiers ?? FEE_TIERS;
+        if (!Array.isArray(tiers) || tiers.length < 1 || tiers.length > 4 || tiers.some(f => !FEE_TIERS.includes(f as (typeof FEE_TIERS)[number]))) {
+            throw new Error("Invalid Uniswap fee tiers");
+        }
+    }
+    async getQuote(tokenIn: Address, tokenOut: Address, amountIn: bigint, options: QuoteOptions = {}): Promise<SwapQuote> {
+        knownOptions(options, ["slippageBps", "feeTiers"]);
+        options = Object.freeze({ ...options, feeTiers: options.feeTiers ? Object.freeze([...options.feeTiers]) : undefined });
+        this.validate(tokenIn, tokenOut, amountIn, options);
+        const deployment = UNISWAP_V3_DEPLOYMENTS[this.wallet.chain.id]!;
+        if (await this.wallet.publicClient.getChainId() !== this.wallet.chain.id) {
+            throw new Error("Quote RPC chain mismatch");
+        }
+        const router = await this.wallet.publicClient.readContract({ address: this.wallet.address, abi: routerView, functionName: "router" });
+        if (router.toLowerCase() !== deployment.ROUTER.toLowerCase()) {
+            throw new Error("Vault router does not match trusted chain deployment");
+        }
+        let best: {
+            amountOut: bigint;
+            fee: number;
+            gasEstimate: bigint;
+        } | undefined;
+        for (const fee of options.feeTiers ?? FEE_TIERS) {
             try {
-                const result = await this.publicClient.readContract({
-                    address: this.config.quoterAddress,
-                    abi: UniswapV3QuoterV2Abi,
-                    functionName: 'quoteExactInputSingle',
-                    args: [{ tokenIn, tokenOut, amount: amountInNet, fee, sqrtPriceLimitX96: 0n }],
-                });
+                const { result } = await this.wallet.publicClient.simulateContract({ address: deployment.QUOTER_V2, abi: UniswapV3QuoterV2Abi, functionName: "quoteExactInputSingle", account: this.wallet.address, args: [{ tokenIn, tokenOut, amount: amountIn, fee, sqrtPriceLimitX96: 0n }] });
                 const [amountOut, , , gasEstimate] = result;
-                if (!bestQuote || amountOut > bestQuote.amountOut) {
-                    bestQuote = { amountOut, gasEstimate, feeTier: fee };
+                if (amountOut > 0n && (!best || amountOut > best.amountOut)) {
+                    best = { amountOut, fee, gasEstimate };
                 }
             }
             catch {
-                // Pool doesn't exist for this fee tier
             }
         }
-        if (!bestQuote) {
-            throw new Error(`SwapModule: No Uniswap V3 pool found for ${tokenIn} → ${tokenOut} on Base.`);
+        if (!best) {
+            throw new Error("No usable Uniswap V3 quote on configured chain");
         }
-        const amountOutMinimum = applySlippage(bestQuote.amountOut, slippageBps);
-        const effectiveRate = amountInNet > 0n ? Number(bestQuote.amountOut) / Number(amountInNet) : 0;
-        return {
-            tokenIn, tokenOut, amountInRaw: amountIn, amountInNet, feeAmount,
-            amountOut: bestQuote.amountOut, amountOutMinimum,
-            poolFeeTier: bestQuote.feeTier, effectiveRate, gasEstimate: bestQuote.gasEstimate,
-        };
-    }
-    async ensureApproval(token, spender, amount) {
-        const currentAllowance = (await this.publicClient.readContract({
-            address: token, abi: ERC20Abi, functionName: 'allowance',
-            args: [this.accountAddress, spender],
-        }));
-        if (currentAllowance >= amount)
-            return undefined;
-        const MAX_UINT256 = 115792089237316195423570985008687907853269984665640564039457584007913129639935n;
-        const account = this.walletClient.account;
-        if (!account)
-            throw new Error('SwapModule: walletClient has no account');
-        const approveData = encodeFunctionData({
-            abi: ERC20Abi, functionName: 'approve', args: [spender, MAX_UINT256],
-        });
-        return this.walletClient.sendTransaction({
-            account, to: token, data: approveData, chain: this.walletClient.chain ?? null,
-        });
-    }
-    async transferFee(token, feeAmount, feeWallet) {
-        const account = this.walletClient.account;
-        if (!account)
-            throw new Error('SwapModule: walletClient has no account');
-        const transferData = encodeFunctionData({
-            abi: ERC20Abi, functionName: 'transfer', args: [feeWallet, feeAmount],
-        });
-        return this.walletClient.sendTransaction({
-            account, to: token, data: transferData, chain: this.walletClient.chain ?? null,
-        });
-    }
-    async swap(tokenIn, tokenOut, amountIn, options = {}) {
-        const slippageBps = options.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
-        const deadlineSecs = options.deadlineSecs ?? 300;
-        const feeWallet = options.feeWallet ?? this.config.feeWallet;
-        const quote = await this.getQuote(tokenIn, tokenOut, amountIn, { slippageBps, feeTiers: options.feeTiers });
-        if (quote.gasEstimate > 2000000n) {
-            console.warn(`SwapModule: High gas estimate (${quote.gasEstimate}). Pool may be illiquid.`);
+        const minimum = applySlippage(best.amountOut, options.slippageBps ?? DEFAULT_SLIPPAGE_BPS);
+        if (minimum === 0n) {
+            throw new Error("Swap output floor rounds to zero");
         }
-        const approvalTxHash = await this.ensureApproval(tokenIn, this.config.routerAddress, amountIn);
-        const approvalRequired = approvalTxHash !== undefined;
-        let feeTxHash;
-        if (quote.feeAmount > 0n) {
-            feeTxHash = await this.transferFee(tokenIn, quote.feeAmount, feeWallet);
+        return Object.freeze({ tokenIn, tokenOut, amountInRaw: amountIn, amountInNet: amountIn, feeAmount: 0n, amountOut: best.amountOut, amountOutMinimum: minimum, poolFeeTier: best.fee, gasEstimate: best.gasEstimate });
+    }
+    async swap(tokenIn: Address, tokenOut: Address, amountIn: bigint, options: SwapOptions = {}): Promise<SwapResult> {
+        knownOptions(options, ["slippageBps", "feeTiers", "deadlineSecs"]);
+        const deadline = calcDeadline(options.deadlineSecs ?? 300);
+        const quote = await this.getQuote(tokenIn, tokenOut, amountIn, { slippageBps: options.slippageBps, feeTiers: options.feeTiers });
+        if (deadline <= BigInt(Math.floor(Date.now() / 1000))) {
+            throw new Error("Swap deadline expired while quoting");
         }
-        const account = this.walletClient.account;
-        if (!account)
-            throw new Error('SwapModule: walletClient has no account');
-        const deadline = calcDeadline(deadlineSecs);
-        const swapData = encodeFunctionData({
-            abi: UniswapV3RouterAbi,
-            functionName: 'exactInputSingle',
-            args: [{
-                    tokenIn, tokenOut, fee: quote.poolFeeTier, recipient: this.accountAddress,
-                    amountIn: quote.amountInNet, amountOutMinimum: quote.amountOutMinimum, sqrtPriceLimitX96: 0n,
-                }],
-        });
-        const txHash = await this.walletClient.sendTransaction({
-            account, to: this.config.routerAddress, data: swapData, chain: this.walletClient.chain ?? null,
-        });
-        return { txHash, feeTxHash, quote, approvalRequired, approvalTxHash };
+        const result = await executeVaultOperation(this.wallet, "agentSwap", [tokenIn, tokenOut, amountIn, quote.amountOutMinimum, quote.poolFeeTier, deadline]);
+        return { ...result, quote, approvalRequired: false };
+    }
+    executeSwap(tokenIn: Address, tokenOut: Address, amountIn: bigint, options: SwapOptions = {}) {
+        return this.swap(tokenIn, tokenOut, amountIn, options);
     }
     getConfig() {
-        return { ...this.config };
-    }
-    setFeeWallet(address) {
-        this.config.feeWallet = address;
+        return Object.freeze({ maxSlippageBps: this.maxSlippageBps, feeBps: 0 });
     }
 }
-export function attachSwap(wallet, config) {
-    const swapModule = new SwapModule(wallet.publicClient, wallet.walletClient, wallet.address, config);
-    return {
-        ...wallet,
-        swapModule,
-        swap: swapModule.swap.bind(swapModule),
-        getQuote: swapModule.getQuote.bind(swapModule),
-    };
+export function attachSwap(wallet: AgentWallet, config: SwapConfig = {}) {
+    const swapModule = new SwapModule(wallet, config);
+    return { ...wallet, swapModule, swap: swapModule.swap.bind(swapModule), executeSwap: swapModule.executeSwap.bind(swapModule), getQuote: swapModule.getQuote.bind(swapModule) };
 }
-//# sourceMappingURL=SwapModule.js.map
