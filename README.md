@@ -1,3 +1,6 @@
+> [!WARNING]
+> **Paused for security maintenance. Do not use in production.**
+
 ⚠️ DEPRECATED — This package has been superseded by the actively maintained version at [agent-wallet-sdk](https://github.com/up2itnow0822/agent-wallet-sdk). Please migrate to the latest version.
 
 ---
